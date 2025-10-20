@@ -260,7 +260,7 @@ def main():
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Training loop
-    num_epochs = 5
+    num_epochs = 15  # Increased for better results
     log_interval = 100
     
     for epoch in range(num_epochs):

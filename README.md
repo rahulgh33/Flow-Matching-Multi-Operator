@@ -82,6 +82,8 @@ Generated samples are saved as PNG files:
 - `specific_digits.png` - User-specified MNIST digits
 - `specific_cifar_classes.png` - User-specified CIFAR-10 classes
 
+Use `python view_results.py` to view all generated images.
+
 ## Implementation Details
 
 The Flow Matching algorithm:
