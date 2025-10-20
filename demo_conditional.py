@@ -1,8 +1,8 @@
 """Demo script for conditional Flow Matching generation."""
 
 import torch
-from fm_mnist_conditional import ConditionalFlowMatchingNet, generate_specific_digits
-from fm_cifar_conditional import ConditionalFlowMatchingNetCIFAR, generate_specific_classes, CIFAR10_CLASSES
+from conditional.fm_mnist_conditional import ConditionalFlowMatchingNet, generate_specific_digits
+from conditional.fm_cifar_conditional import ConditionalFlowMatchingNetCIFAR, generate_specific_classes, CIFAR10_CLASSES
 
 
 def demo_mnist_conditional():

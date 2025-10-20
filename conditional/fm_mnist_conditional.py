@@ -8,6 +8,10 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 from flow_matching_base import (
     FlowMatchingBase, 
     flow_matching_train_step, 
