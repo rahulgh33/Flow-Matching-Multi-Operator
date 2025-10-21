@@ -8,6 +8,7 @@ Flow Matching learns continuous normalizing flows by predicting velocity fields 
 
 - **Unconditional generation**: Random sampling from learned data distributions
 - **Conditional generation**: Generate specific classes/digits on command
+- **Optimized training**: Straightened path training with endpoint emphasis for fast generation
 - **Modular architecture**: Shared base classes for easy extension
 
 ## Quick Start
@@ -58,21 +59,29 @@ Both models use encoder-decoder architectures with time and class conditioning:
 
 ## Algorithm
 
-Flow Matching training:
+Flow Matching with optimizations:
 1. Sample noise x₀ ~ N(0,I) and data x₁ from dataset
-2. Sample time t ~ Uniform(0,1)
-3. Interpolate: x_t = (1-t)x₀ + tx₁
-4. Predict velocity: v_θ(x_t, t, c) ≈ x₁ - x₀
-5. Minimize: ||v_θ(x_t, t, c) - (x₁ - x₀)||²
+2. Sample time t ~ Beta(0.5,0.5) for endpoint emphasis
+3. Straightened path: x_t = (1-t²)x₀ + t²x₁
+4. Predict velocity: v_θ(x_t, t, c) ≈ 2t(x₁ - x₀)
+5. Minimize: ||v_θ(x_t, t, c) - 2t(x₁ - x₀)||²
 
-Generation uses Euler integration: x_{t+dt} = x_t + v_θ(x_t, t, c) * dt
+Generation uses Heun integration with cosine time grid for efficient few-step sampling.
 
 ## Results
 
-Training generates sample images:
-- `fm_samples.png` - Unconditional MNIST
-- `fm_cfortan_samples.png` - Unconditional CIFAR-10  
-- `conditional_mnist_samples.png` - All MNIST digits (0-9)
-- `specific_digits.png` - User-requested digits
+Generated samples are saved in the `results/` folder:
+
+### Speed Comparison
+- `15steps_target.png` - Main result: 15-step generation
+- `100steps_baseline.png` - Baseline: 100-step generation
+- `12steps_ultrafast.png` - Ultra-fast: 12-step generation
+- `20steps_balanced.png` - Balanced: 20-step generation
+
+**Performance**: 15 steps vs 100 steps = 6.7x speedup
+
+### Sample Quality
+- `final_optimized.png` - Best quality samples
 - `conditional_cifar_samples.png` - All CIFAR-10 classes
-- `specific_cifar_classes.png` - User-requested classes
+- `conditional_mnist_samples.png` - All MNIST digits
+- `specific_cifar_classes.png` - Targeted class generation
