@@ -72,16 +72,14 @@ Generation uses Heun integration with cosine time grid for efficient few-step sa
 
 Generated samples are saved in the `results/` folder:
 
-### Speed Comparison
-- `15steps_target.png` - Main result: 15-step generation
-- `100steps_baseline.png` - Baseline: 100-step generation
-- `12steps_ultrafast.png` - Ultra-fast: 12-step generation
-- `20steps_balanced.png` - Balanced: 20-step generation
+### CIFAR-10 (`results/cifar/`)
+- `15steps.png` - Main result: 15-step generation
+- `100steps.png` - Baseline: 100-step generation
+- `12steps.png`, `20steps.png` - Additional speed comparisons
+- `conditional_samples.png` - All CIFAR-10 classes
 
 **Performance**: 15 steps vs 100 steps = 6.7x speedup
 
-### Sample Quality
-- `final_optimized.png` - Best quality samples
-- `conditional_cifar_samples.png` - All CIFAR-10 classes
-- `conditional_mnist_samples.png` - All MNIST digits
-- `specific_cifar_classes.png` - Targeted class generation
+### MNIST (`results/mnist/`)
+- `conditional_samples.png` - All MNIST digits
+- `specific_digits.png` - Targeted digit generation

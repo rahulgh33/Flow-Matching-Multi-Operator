@@ -432,7 +432,7 @@ def main():
         else:
             samples = generate_samples(model, device, all_labels, num_steps=steps)
         
-        filename = f"results/{steps}steps.png"
+        filename = f"results/cifar/{steps}steps.png"
         visualize_samples(samples, all_labels, save_path=filename)
     
     # Restore original weights
