@@ -432,7 +432,7 @@ def main():
         else:
             samples = generate_samples(model, device, all_labels, num_steps=steps)
         
-        filename = f"optimized_{steps}steps.png"
+        filename = f"results/{steps}steps.png"
         visualize_samples(samples, all_labels, save_path=filename)
     
     # Restore original weights
