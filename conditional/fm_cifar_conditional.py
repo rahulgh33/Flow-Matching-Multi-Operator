@@ -1,4 +1,14 @@
-"""Conditional Flow Matching implementation for CIFAR-10 class generation."""
+"""
+Optimized Conditional Flow Matching for CIFAR-10
+
+This implementation incorporates several key optimizations for fast, high-quality generation:
+1. Straightened path training (α(t) = t²) for smoother ODE integration
+2. Beta(0.5,0.5) time sampling for endpoint emphasis
+3. EMA weights for improved sample quality
+4. Cosine time grid + Heun solver for efficient few-step generation
+
+Target: 15-20 steps vs 100-step diffusion models (5-7x speedup)
+"""
 
 import torch
 import torch.nn as nn
@@ -7,112 +17,253 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
-
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from flow_matching_base import FlowMatchingBase
 
-from flow_matching_base import (
-    FlowMatchingBase, 
-    create_time_embedding
-)
-
-# CIFAR-10 class names
+# CIFAR-10 class names for visualization
 CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer', 
                    'dog', 'frog', 'horse', 'ship', 'truck']
 
 
-class ConditionalFlowMatchingNetCIFAR(FlowMatchingBase):
-    """Conditional Flow Matching network for CIFAR-10 generation with class and time conditioning."""
+class ResBlock(nn.Module):
+    """Residual block with FiLM conditioning for time and class information."""
     
-    def __init__(self, channels: int = 3, hidden_dim: int = 256, num_classes: int = 10):
+    def __init__(self, channels, cond_dim):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(32, channels//4), channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(min(32, channels//4), channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        
+        # FiLM conditioning: Feature-wise Linear Modulation
+        self.cond_proj = nn.Linear(cond_dim, channels * 2)
+        self.activation = nn.SiLU()  # Swish activation for better gradients
+        
+    def forward(self, x, cond):
+        residual = x
+        
+        # First conv block
+        h = self.activation(self.norm1(x))
+        h = self.conv1(h)
+        
+        # Apply FiLM conditioning
+        scale, shift = self.cond_proj(cond).chunk(2, dim=1)
+        h = h * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+        
+        # Second conv block
+        h = self.activation(self.norm2(h))
+        h = self.conv2(h)
+        
+        return h + residual
+
+
+class SelfAttention(nn.Module):
+    """Multi-head self-attention for capturing global dependencies."""
+    
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.norm = nn.GroupNorm(min(32, channels//4), channels)
+        self.num_heads = 8
+        self.head_dim = channels // self.num_heads
+        
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj_out = nn.Conv2d(channels, channels, 1)
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        
+        qkv = self.qkv(h).view(B, 3, self.num_heads, self.head_dim, H * W)
+        q, k, v = qkv.unbind(1)
+        
+        # Scaled dot-product attention
+        scale = self.head_dim ** -0.5
+        attn = torch.einsum('bhdi,bhdj->bhij', q, k) * scale
+        attn = F.softmax(attn, dim=-1)
+        
+        out = torch.einsum('bhij,bhdj->bhdi', attn, v)
+        out = out.contiguous().view(B, C, H, W)
+        
+        return x + self.proj_out(out)
+
+
+class ConditionalFlowMatchingNetCIFAR(FlowMatchingBase):
+    """
+    Optimized Flow Matching Network for CIFAR-10
+    
+    Key features:
+    - ResNet encoder-decoder (no skip connections for cleaner FM story)
+    - Class-conditional generation via FiLM
+    - Optimized for few-step generation (15-20 steps)
+    """
+    
+    def __init__(self, channels: int = 3, hidden_dim: int = 160, num_classes: int = 10):
         super().__init__(channels, hidden_dim)
         self.num_classes = num_classes
         
-        # Encoder: 32x32 -> 8x8
-        self.encoder = nn.Sequential(
-            nn.Conv2d(channels, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),  # 16x16
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, hidden_dim, 3, stride=2, padding=1),  # 8x8
-            nn.ReLU(inplace=True)
+        # Enhanced conditioning embeddings
+        self.time_embedding = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim * 4)
         )
         
-        # Time embedding network
-        self.time_embedding = create_time_embedding(1, hidden_dim)
-        
-        # Class embedding network
         self.class_embedding = nn.Sequential(
             nn.Embedding(num_classes, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.SiLU(), 
+            nn.Linear(hidden_dim * 2, hidden_dim * 4)
         )
         
-        # Fusion layer (spatial + time + class)
-        self.fusion = nn.Linear(hidden_dim * 8 * 8 + hidden_dim + hidden_dim, hidden_dim * 8 * 8)
+        # Encoder: 32x32 -> 8x8
+        self.conv_in = nn.Conv2d(channels, hidden_dim, 3, padding=1)
         
-        # Decoder: 8x8 -> 32x32
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(hidden_dim, 128, 4, stride=2, padding=1),  # 16x16
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # 32x32
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, channels, 3, padding=1)
+        # Down path
+        self.down1 = nn.ModuleList([
+            ResBlock(hidden_dim, hidden_dim * 4),
+            ResBlock(hidden_dim, hidden_dim * 4),
+        ])
+        self.down1_conv = nn.Conv2d(hidden_dim, hidden_dim * 2, 3, stride=2, padding=1)
+        
+        self.down2 = nn.ModuleList([
+            ResBlock(hidden_dim * 2, hidden_dim * 4),
+            ResBlock(hidden_dim * 2, hidden_dim * 4),
+        ])
+        self.down2_conv = nn.Conv2d(hidden_dim * 2, hidden_dim * 4, 3, stride=2, padding=1)
+        
+        # Bottleneck with attention
+        self.bottleneck = nn.ModuleList([
+            ResBlock(hidden_dim * 4, hidden_dim * 4),
+            ResBlock(hidden_dim * 4, hidden_dim * 4),
+            SelfAttention(hidden_dim * 4),
+            ResBlock(hidden_dim * 4, hidden_dim * 4),
+        ])
+        
+        # Up path (NO skip connections - key for clean FM)
+        self.up2_conv = nn.ConvTranspose2d(hidden_dim * 4, hidden_dim * 2, 4, stride=2, padding=1)
+        self.up2 = nn.ModuleList([
+            ResBlock(hidden_dim * 2, hidden_dim * 4),
+            ResBlock(hidden_dim * 2, hidden_dim * 4),
+        ])
+        
+        self.up1_conv = nn.ConvTranspose2d(hidden_dim * 2, hidden_dim, 4, stride=2, padding=1)
+        self.up1 = nn.ModuleList([
+            ResBlock(hidden_dim, hidden_dim * 4),
+            ResBlock(hidden_dim, hidden_dim * 4),
+        ])
+        
+        # Output layer
+        self.conv_out = nn.Sequential(
+            nn.GroupNorm(min(32, hidden_dim//4), hidden_dim),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, channels, 3, padding=1)
         )
+        
+        # Zero-initialize final layer for training stability
+        nn.init.zeros_(self.conv_out[-1].weight)
+        nn.init.zeros_(self.conv_out[-1].bias)
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, class_labels: torch.Tensor) -> torch.Tensor:
-        """Forward pass with time and class conditioning."""
-        batch_size = x.size(0)
+        """Forward pass: predict velocity field v(x,t,c)."""
+        # Embed conditioning information
+        t_emb = self.time_embedding(t)
+        c_emb = self.class_embedding(class_labels)
+        cond = t_emb + c_emb  # Combined conditioning
         
-        # Encode spatial features
-        h = self.encoder(x)  # (B, hidden_dim, 8, 8)
-        h_flat = h.view(batch_size, -1)  # (B, hidden_dim * 8 * 8)
+        # Encoder
+        h = self.conv_in(x)
         
-        # Embed time
-        t_emb = self.time_embedding(t)  # (B, hidden_dim)
+        for block in self.down1:
+            h = block(h, cond)
+        h = self.down1_conv(h)
         
-        # Embed class
-        c_emb = self.class_embedding(class_labels)  # (B, hidden_dim)
+        for block in self.down2:
+            h = block(h, cond)
+        h = self.down2_conv(h)
         
-        # Fuse features, time, and class
-        combined = torch.cat([h_flat, t_emb, c_emb], dim=-1)
-        fused = self.fusion(combined)
-        fused = fused.view(batch_size, self.hidden_dim, 8, 8)
+        # Bottleneck
+        for block in self.bottleneck:
+            if isinstance(block, SelfAttention):
+                h = block(h)
+            else:
+                h = block(h, cond)
         
-        # Decode to velocity field
-        velocity = self.decoder(fused)
-        return velocity
+        # Decoder (no skip connections)
+        h = self.up2_conv(h)
+        for block in self.up2:
+            h = block(h, cond)
+            
+        h = self.up1_conv(h)
+        for block in self.up1:
+            h = block(h, cond)
+        
+        return self.conv_out(h)
 
 
-def conditional_train_step_cifar(
-    model: ConditionalFlowMatchingNetCIFAR, 
-    data_batch: torch.Tensor, 
-    labels_batch: torch.Tensor,
-    optimizer: torch.optim.Optimizer, 
-    device: torch.device
-) -> float:
-    """Single training step for conditional CIFAR-10 flow matching."""
+# ============================================================================
+# OPTIMIZED SAMPLING AND TRAINING
+# ============================================================================
+
+def cosine_grid(N, device):
+    """Cosine time grid that concentrates steps near t=0 and t=1."""
+    u = torch.linspace(0, 1, N+1, device=device)
+    s = torch.sin(0.5 * torch.pi * u)
+    return (s - s[0]) / (s[-1] - s[0])
+
+
+@torch.no_grad()
+def sample_heun_optimized(model, x, labels, steps=20):
+    """Optimized Heun sampler with cosine time grid."""
+    ts = cosine_grid(steps, x.device)
+    for i in range(steps):
+        t0 = ts[i].expand(x.size(0), 1)
+        t1 = ts[i+1].expand(x.size(0), 1)
+        dt = (t1 - t0).view(-1, 1, 1, 1)
+        
+        # Heun's method (2nd order ODE solver)
+        v0 = model(x, t0, labels)
+        x_pred = x + v0 * dt
+        v1 = model(x_pred, t1, labels)
+        x = x + 0.5 * (v0 + v1) * dt
+        
+        # Stability clamp
+        x = torch.clamp(x, -3, 3)
+    return x
+
+
+def optimized_train_step(model, data_batch, labels_batch, optimizer, device):
+    """
+    Optimized training step with:
+    1. Straightened path (α(t) = t²)
+    2. Beta(0.5,0.5) time sampling for endpoint emphasis
+    """
     model.train()
     batch_size = data_batch.size(0)
-    
-    # Sample noise as starting point (x0)
     noise = torch.randn_like(data_batch)
     
-    # Sample random interpolation times
-    t = torch.rand(batch_size, 1, device=device)
+    # Beta(0.5,0.5) sampling for U-shaped distribution (endpoint emphasis)
+    beta_dist = torch.distributions.Beta(0.5, 0.5)
+    t = beta_dist.sample((batch_size, 1)).to(device)
     
-    # Linear interpolation between noise and data
+    # Straightened path: α(t) = t² makes ODE easier to integrate
+    gamma = 2.0
     t_expanded = t.view(-1, 1, 1, 1)
-    x_t = (1 - t_expanded) * noise + t_expanded * data_batch
+    alpha = t_expanded ** gamma
+    dalpha_dt = gamma * (t_expanded ** (gamma - 1) + 1e-6)
     
-    # Target velocity field (constant for linear interpolation)
-    target_velocity = data_batch - noise
+    # Interpolation and target velocity
+    x_t = (1 - alpha) * noise + alpha * data_batch
+    target_velocity = dalpha_dt * (data_batch - noise)
     
-    # Predict velocity field with class conditioning
+    # Predict and compute loss
     predicted_velocity = model(x_t, t, labels_batch)
-    
-    # Compute MSE loss
     loss = F.mse_loss(predicted_velocity, target_velocity)
     
     # Optimization step
@@ -123,152 +274,175 @@ def conditional_train_step_cifar(
     return loss.item()
 
 
+class EMAHelper:
+    """Exponential Moving Average for improved sample quality."""
+    
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = self.decay * self.shadow[name] + (1 - self.decay) * param.data
+    
+    def apply_shadow(self, model):
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+    
+    def restore(self, model):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.backup[name])
+
+
+# ============================================================================
+# GENERATION AND EVALUATION
+# ============================================================================
+
 @torch.no_grad()
-def generate_conditional_cifar_samples(
-    model: ConditionalFlowMatchingNetCIFAR, 
-    device: torch.device, 
-    class_labels: torch.Tensor,
-    num_steps: int = 50
-) -> torch.Tensor:
-    """Generate CIFAR-10 samples conditioned on specific class labels."""
+def generate_samples(model, device, class_labels, num_steps=15):
+    """Generate samples using optimized settings."""
     model.eval()
-    num_samples = len(class_labels)
-    
-    # Start from pure noise
-    x = torch.randn(num_samples, 3, 32, 32, device=device)
-    
-    # Time discretization
-    time_steps = torch.linspace(0, 1, num_steps + 1, device=device)
-    dt = 1.0 / num_steps
-    
-    # Euler integration with class conditioning
-    for i in range(num_steps):
-        t = time_steps[i].expand(num_samples, 1)
-        velocity = model(x, t, class_labels)
-        x = x + velocity * dt
-    
-    return x
+    x = torch.randn(len(class_labels), 3, 32, 32, device=device)
+    return sample_heun_optimized(model, x, class_labels, steps=num_steps)
 
 
-def create_cifar_conditional_data_loader(batch_size: int = 128) -> DataLoader:
-    """Create CIFAR-10 data loader with proper preprocessing."""
+def create_data_loader(batch_size=64):
+    """Create CIFAR-10 data loader."""
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x * 2 - 1)  # Scale to [-1, 1]
     ])
     
-    dataset = datasets.CIFAR10(
-        root="./data", 
-        train=True, 
-        download=True, 
-        transform=transform
-    )
-    
+    dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 
-def visualize_conditional_cifar_samples(samples: torch.Tensor, labels: torch.Tensor, save_path: str = "conditional_cifar_samples.png"):
-    """Visualize generated conditional CIFAR-10 samples with their labels."""
-    samples = samples.cpu()
-    labels = labels.cpu()
-    
-    # Convert from [-1, 1] to [0, 1] for visualization
-    samples = (samples + 1) / 2
+def visualize_samples(samples, labels, save_path="samples.png"):
+    """Visualize generated samples with class labels."""
+    samples = (samples.cpu() + 1) / 2  # Convert to [0, 1]
     
     fig, axes = plt.subplots(4, 4, figsize=(12, 12))
-    fig.suptitle("Conditional CIFAR-10 Generation", fontsize=16)
+    fig.suptitle("Flow Matching Results", fontsize=16)
     
     for i, ax in enumerate(axes.flat):
         if i < len(samples):
-            # Convert from CHW to HWC format
             img = samples[i].permute(1, 2, 0).clamp(0, 1)
             ax.imshow(img)
             class_name = CIFAR10_CLASSES[labels[i].item()]
-            ax.set_title(f"{class_name} ({labels[i].item()})", fontsize=10)
+            ax.set_title(f"{class_name}", fontsize=10)
         ax.axis("off")
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"Saved conditional CIFAR-10 samples to {save_path}")
+    print(f"Saved samples to {save_path}")
 
 
-def generate_specific_classes(model: ConditionalFlowMatchingNetCIFAR, device: torch.device, class_indices: list):
-    """Generate specific CIFAR-10 classes and visualize them."""
-    # Create labels tensor
-    labels = torch.tensor(class_indices, device=device)
-    
-    # Generate samples
-    samples = generate_conditional_cifar_samples(model, device, labels, num_steps=50)
-    
-    # Convert for visualization
-    samples = (samples.cpu() + 1) / 2
-    
-    # Visualize
-    fig, axes = plt.subplots(1, len(class_indices), figsize=(3*len(class_indices), 3))
-    if len(class_indices) == 1:
-        axes = [axes]
-    
-    fig.suptitle("Generated Specific CIFAR-10 Classes", fontsize=16)
-    
-    for i, (sample, class_idx) in enumerate(zip(samples, class_indices)):
-        img = sample.permute(1, 2, 0).clamp(0, 1)
-        axes[i].imshow(img)
-        class_name = CIFAR10_CLASSES[class_idx]
-        axes[i].set_title(f"{class_name}", fontsize=12)
-        axes[i].axis("off")
-    
-    plt.tight_layout()
-    plt.savefig("specific_cifar_classes.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Generated classes: {[CIFAR10_CLASSES[i] for i in class_indices]}")
-    print("Saved to specific_cifar_classes.png")
-
+# ============================================================================
+# MAIN TRAINING AND EVALUATION
+# ============================================================================
 
 def main():
-    """Main training and generation pipeline for conditional CIFAR-10."""
-    # Configuration
+    """Main training and evaluation pipeline."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Data
-    train_loader = create_cifar_conditional_data_loader(batch_size=128)
+    # Clear GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
-    # Model and optimizer (lower learning rate for CIFAR-10)
-    model = ConditionalFlowMatchingNetCIFAR(channels=3, num_classes=10).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    # Data and model
+    train_loader = create_data_loader(batch_size=64)
+    model = ConditionalFlowMatchingNetCIFAR(channels=3, hidden_dim=160, num_classes=10).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print("Key Optimizations:")
+    print("- Straightened path (α(t) = t²)")
+    print("- Beta(0.5,0.5) time sampling")
+    print("- EMA weights (decay=0.999)")
+    print("- Cosine time grid + Heun solver")
+    
+    # Training setup
+    num_epochs = 50
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs-1, eta_min=1e-6)
+    ema_helper = EMAHelper(model, decay=0.999)
     
     # Training loop
-    num_epochs = 10  # Reduced for demo
-    log_interval = 100
-    
     for epoch in range(num_epochs):
         epoch_losses = []
         
+        # Warmup learning rate for first epoch
+        if epoch == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 1e-5
+        elif epoch == 1:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 1e-4
+        
         for batch_idx, (data, labels) in enumerate(train_loader):
-            data = data.to(device)
-            labels = labels.to(device)
-            loss = conditional_train_step_cifar(model, data, labels, optimizer, device)
-            epoch_losses.append(loss)
+            data, labels = data.to(device), labels.to(device)
             
-            if batch_idx % log_interval == 0:
+            loss = optimized_train_step(model, data, labels, optimizer, device)
+            epoch_losses.append(loss)
+            ema_helper.update(model)
+            
+            if batch_idx % 100 == 0:
                 print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}, Loss: {loss:.4f}")
         
         avg_loss = sum(epoch_losses) / len(epoch_losses)
-        print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}, LR: {current_lr:.2e}")
+        
+        if epoch >= 1:
+            scheduler.step()
     
-    # Generate samples for all classes
-    print("Generating samples for all classes...")
-    all_labels = torch.arange(10, device=device).repeat(2)  # 2 samples per class
-    samples = generate_conditional_cifar_samples(model, device, all_labels, num_steps=50)
-    visualize_conditional_cifar_samples(samples, all_labels)
+    # Generation with EMA weights
+    print("Switching to EMA weights for generation...")
+    ema_helper.apply_shadow(model)
     
-    # Generate specific classes
-    print("Generating specific classes...")
-    # Generate: airplane, cat, dog, ship
-    generate_specific_classes(model, device, [0, 3, 5, 8])
+    # Generate comparison samples
+    all_labels = torch.arange(10, device=device).repeat(2)
+    
+    configs = [
+        (15, "Optimized Target (15 steps)"),
+        (100, "Baseline (100 steps)")
+    ]
+    
+    for steps, desc in configs:
+        print(f"Generating {desc}...")
+        if steps == 100:
+            # Use simple Euler for baseline comparison
+            x = torch.randn(len(all_labels), 3, 32, 32, device=device)
+            time_steps = torch.linspace(0, 1, steps + 1, device=device)
+            for i in range(steps):
+                t_curr = time_steps[i].expand(x.size(0), 1)
+                dt = time_steps[i + 1] - time_steps[i]
+                v = model(x, t_curr, all_labels)
+                x = x + v * dt
+            samples = x
+        else:
+            samples = generate_samples(model, device, all_labels, num_steps=steps)
+        
+        filename = f"optimized_{steps}steps.png"
+        visualize_samples(samples, all_labels, save_path=filename)
+    
+    # Restore original weights
+    ema_helper.restore(model)
+    
+    print("\nOPTIMIZATION RESULTS:")
+    print("Target: 15 steps vs 100 steps = 6.7x speedup")
+    print("Key innovations: Straightened path + Beta sampling + EMA + Cosine grid")
+    print("Architecture: ResNet encoder-decoder (no skip connections)")
+    print("Check generated images for quality comparison")
 
 
 if __name__ == "__main__":
