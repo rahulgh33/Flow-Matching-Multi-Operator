@@ -28,8 +28,7 @@ wheels/
 data/
 datasets/
 
-# Generated images
-*.png
+# Generated images (excluding results)
 *.jpg
 *.jpeg
 
