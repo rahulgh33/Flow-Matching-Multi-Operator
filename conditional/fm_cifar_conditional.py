@@ -204,16 +204,14 @@ class UNetFlowMatching(FlowMatchingBase):
         self.conv_in = nn.Conv2d(channels, base_channels, 3, padding=1)
         
         # U-Net encoder (downsampling path)
-        self.down1 = DownBlock(base_channels, base_channels, time_dim, attention=False)      # 32x32
-        self.down2 = DownBlock(base_channels, base_channels*2, time_dim, attention=False)   # 16x16  
-        self.down3 = DownBlock(base_channels*2, base_channels*4, time_dim, attention=True)  # 8x8
-        self.down4 = DownBlock(base_channels*4, base_channels*8, time_dim, attention=True, downsample=False)  # 8x8 (no downsample)
+        self.down1 = DownBlock(base_channels, base_channels*2, time_dim, attention=False)    # 32x32 -> 16x16
+        self.down2 = DownBlock(base_channels*2, base_channels*4, time_dim, attention=False)  # 16x16 -> 8x8  
+        self.down3 = DownBlock(base_channels*4, base_channels*8, time_dim, attention=True, downsample=False)  # 8x8 (bottleneck)
         
         # U-Net decoder (upsampling path)
-        self.up4 = UpBlock(base_channels*8, base_channels*4, time_dim, attention=True, upsample=False)  # 8x8
-        self.up3 = UpBlock(base_channels*4, base_channels*2, time_dim, attention=True)   # 16x16
-        self.up2 = UpBlock(base_channels*2, base_channels, time_dim, attention=False)    # 32x32
-        self.up1 = UpBlock(base_channels, base_channels, time_dim, attention=False, upsample=False)  # 32x32
+        self.up3 = UpBlock(base_channels*8, base_channels*4, time_dim, attention=True, upsample=False)  # 8x8
+        self.up2 = UpBlock(base_channels*4, base_channels*2, time_dim, attention=True)   # 8x8 -> 16x16
+        self.up1 = UpBlock(base_channels*2, base_channels, time_dim, attention=False)    # 16x16 -> 32x32
         
         # Output projection
         self.conv_out = nn.Sequential(
@@ -260,14 +258,12 @@ class UNetFlowMatching(FlowMatchingBase):
         # Encoder with skip connections
         x1, skip1 = self.down1(x, cond)      # 32x32 -> 16x16
         x2, skip2 = self.down2(x1, cond)     # 16x16 -> 8x8
-        x3, skip3 = self.down3(x2, cond)     # 8x8 -> 8x8 (no downsample in down4)
-        x4, skip4 = self.down4(x3, cond)     # 8x8 -> 8x8
+        x3, skip3 = self.down3(x2, cond)     # 8x8 (bottleneck)
         
         # Decoder with skip connections
-        x = self.up4(x4, skip4, cond)        # 8x8
-        x = self.up3(x, skip3, cond)         # 8x8 -> 16x16
-        x = self.up2(x, skip2, cond)         # 16x16 -> 32x32
-        x = self.up1(x, skip1, cond)         # 32x32
+        x = self.up3(x3, skip3, cond)        # 8x8
+        x = self.up2(x, skip2, cond)         # 8x8 -> 16x16
+        x = self.up1(x, skip1, cond)         # 16x16 -> 32x32
         
         # Output
         return self.conv_out(x)

@@ -127,16 +127,14 @@ class InpaintingUNet(FlowMatchingBase):
         self.conv_in = nn.Conv2d(input_channels, base_channels, 3, padding=1)
         
         # U-Net encoder
-        self.down1 = InpaintingDownBlock(base_channels, base_channels, time_dim, attention=False)
-        self.down2 = InpaintingDownBlock(base_channels, base_channels*2, time_dim, attention=False)
-        self.down3 = InpaintingDownBlock(base_channels*2, base_channels*4, time_dim, attention=True)
-        self.down4 = InpaintingDownBlock(base_channels*4, base_channels*8, time_dim, attention=True, downsample=False)
+        self.down1 = InpaintingDownBlock(base_channels, base_channels*2, time_dim, attention=False)
+        self.down2 = InpaintingDownBlock(base_channels*2, base_channels*4, time_dim, attention=False)
+        self.down3 = InpaintingDownBlock(base_channels*4, base_channels*8, time_dim, attention=True, downsample=False)
         
         # U-Net decoder
-        self.up4 = InpaintingUpBlock(base_channels*8, base_channels*4, time_dim, attention=True, upsample=False)
-        self.up3 = InpaintingUpBlock(base_channels*4, base_channels*2, time_dim, attention=True)
-        self.up2 = InpaintingUpBlock(base_channels*2, base_channels, time_dim, attention=False)
-        self.up1 = InpaintingUpBlock(base_channels, base_channels, time_dim, attention=False, upsample=False)
+        self.up3 = InpaintingUpBlock(base_channels*8, base_channels*4, time_dim, attention=True, upsample=False)
+        self.up2 = InpaintingUpBlock(base_channels*4, base_channels*2, time_dim, attention=True)
+        self.up1 = InpaintingUpBlock(base_channels*2, base_channels, time_dim, attention=False)
         
         # Output projection
         self.conv_out = nn.Sequential(
@@ -192,11 +190,9 @@ class InpaintingUNet(FlowMatchingBase):
         x1, skip1 = self.down1(x, t_emb)
         x2, skip2 = self.down2(x1, t_emb)
         x3, skip3 = self.down3(x2, t_emb)
-        x4, skip4 = self.down4(x3, t_emb)
         
         # U-Net decoder with skip connections
-        x = self.up4(x4, skip4, t_emb)
-        x = self.up3(x, skip3, t_emb)
+        x = self.up3(x3, skip3, t_emb)
         x = self.up2(x, skip2, t_emb)
         x = self.up1(x, skip1, t_emb)
         
