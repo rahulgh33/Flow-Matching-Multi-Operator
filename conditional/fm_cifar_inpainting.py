@@ -467,6 +467,10 @@ def main():
     
     inpainted_batch = torch.cat(inpainted_results, dim=0)
     
+    # Create results directory if it doesn't exist
+    import os
+    os.makedirs("results/cifar", exist_ok=True)
+    
     # Visualize results
     visualize_inpainting_results(
         test_data, test_masked, test_masks, inpainted_batch,
