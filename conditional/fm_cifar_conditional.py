@@ -510,6 +510,10 @@ def main():
     # Generate comparison samples
     all_labels = torch.arange(10, device=device).repeat(2)
     
+    # Create results directory if it doesn't exist
+    import os
+    os.makedirs("results/cifar", exist_ok=True)
+    
     configs = [
         (15, "U-Net Target (15 steps)"),
         (25, "U-Net High Quality (25 steps)"),
