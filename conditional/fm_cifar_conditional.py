@@ -1,13 +1,11 @@
 """
-Optimized Conditional Flow Matching for CIFAR-10
+U-Net Flow Matching for CIFAR-10
 
-This implementation incorporates several key optimizations for fast, high-quality generation:
-1. Straightened path training (α(t) = t²) for smoother ODE integration
-2. Beta(0.5,0.5) time sampling for endpoint emphasis
-3. EMA weights for improved sample quality
-4. Cosine time grid + Heun solver for efficient few-step generation
-
-Target: 15-20 steps vs 100-step diffusion models (5-7x speedup)
+Full U-Net implementation optimized for fast inference with Flow Matching:
+- U-Net architecture with skip connections for better quality
+- Multi-scale attention for global context
+- Optimized training with EMA and advanced solvers
+- Target: 15 steps for fast, high-quality generation
 """
 
 import torch
@@ -29,23 +27,33 @@ CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
 
 
 class ResBlock(nn.Module):
-    """Residual block with FiLM conditioning for time and class information."""
+    """ResNet block with time and class conditioning via FiLM."""
     
-    def __init__(self, channels, cond_dim):
+    def __init__(self, in_channels, out_channels, cond_dim, dropout=0.1):
         super().__init__()
-        self.norm1 = nn.GroupNorm(min(32, channels//4), channels)
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.norm2 = nn.GroupNorm(min(32, channels//4), channels)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         
-        # FiLM conditioning: Feature-wise Linear Modulation
-        self.cond_proj = nn.Linear(cond_dim, channels * 2)
-        self.activation = nn.SiLU()  # Swish activation for better gradients
+        # Group normalization (better than BatchNorm for small batches)
+        self.norm1 = nn.GroupNorm(32, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.dropout = nn.Dropout(dropout)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        
+        # FiLM conditioning
+        self.cond_proj = nn.Linear(cond_dim, out_channels * 2)
+        
+        # Skip connection
+        if in_channels != out_channels:
+            self.skip = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.skip = nn.Identity()
+            
+        self.activation = nn.SiLU()
         
     def forward(self, x, cond):
-        residual = x
-        
-        # First conv block
         h = self.activation(self.norm1(x))
         h = self.conv1(h)
         
@@ -53,23 +61,23 @@ class ResBlock(nn.Module):
         scale, shift = self.cond_proj(cond).chunk(2, dim=1)
         h = h * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
         
-        # Second conv block
         h = self.activation(self.norm2(h))
+        h = self.dropout(h)
         h = self.conv2(h)
         
-        return h + residual
+        return h + self.skip(x)
 
 
-class SelfAttention(nn.Module):
-    """Multi-head self-attention for capturing global dependencies."""
+class AttentionBlock(nn.Module):
+    """Multi-head attention block for U-Net."""
     
-    def __init__(self, channels):
+    def __init__(self, channels, num_heads=8):
         super().__init__()
         self.channels = channels
-        self.norm = nn.GroupNorm(min(32, channels//4), channels)
-        self.num_heads = 8
-        self.head_dim = channels // self.num_heads
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
         
+        self.norm = nn.GroupNorm(32, channels)
         self.qkv = nn.Conv2d(channels, channels * 3, 1)
         self.proj_out = nn.Conv2d(channels, channels, 1)
         
@@ -80,7 +88,7 @@ class SelfAttention(nn.Module):
         qkv = self.qkv(h).view(B, 3, self.num_heads, self.head_dim, H * W)
         q, k, v = qkv.unbind(1)
         
-        # Scaled dot-product attention
+        # Attention
         scale = self.head_dim ** -0.5
         attn = torch.einsum('bhdi,bhdj->bhij', q, k) * scale
         attn = F.softmax(attn, dim=-1)
@@ -91,120 +99,178 @@ class SelfAttention(nn.Module):
         return x + self.proj_out(out)
 
 
-class ConditionalFlowMatchingNetCIFAR(FlowMatchingBase):
-    """
-    Optimized Flow Matching Network for CIFAR-10
+class DownBlock(nn.Module):
+    """Downsampling block with ResBlocks and optional attention."""
     
-    Key features:
-    - ResNet encoder-decoder (no skip connections for cleaner FM story)
-    - Class-conditional generation via FiLM
-    - Optimized for few-step generation (15-20 steps)
+    def __init__(self, in_channels, out_channels, cond_dim, num_layers=2, downsample=True, attention=False):
+        super().__init__()
+        self.downsample = downsample
+        
+        # ResNet blocks
+        layers = []
+        for i in range(num_layers):
+            in_ch = in_channels if i == 0 else out_channels
+            layers.append(ResBlock(in_ch, out_channels, cond_dim))
+        self.layers = nn.ModuleList(layers)
+        
+        # Optional attention
+        self.attention = AttentionBlock(out_channels) if attention else None
+        
+        # Downsampling
+        if downsample:
+            self.downsample_conv = nn.Conv2d(out_channels, out_channels, 3, stride=2, padding=1)
+        
+    def forward(self, x, cond):
+        for layer in self.layers:
+            x = layer(x, cond)
+            
+        if self.attention:
+            x = self.attention(x)
+            
+        if self.downsample:
+            return self.downsample_conv(x), x  # Return both downsampled and skip
+        else:
+            return x, x
+
+
+class UpBlock(nn.Module):
+    """Upsampling block with ResBlocks, skip connections, and optional attention."""
+    
+    def __init__(self, in_channels, out_channels, cond_dim, num_layers=2, upsample=True, attention=False):
+        super().__init__()
+        self.upsample = upsample
+        
+        # Upsampling
+        if upsample:
+            self.upsample_conv = nn.ConvTranspose2d(in_channels, in_channels, 4, stride=2, padding=1)
+        
+        # ResNet blocks (input has skip connection concatenated)
+        layers = []
+        for i in range(num_layers):
+            in_ch = in_channels * 2 if i == 0 else out_channels  # *2 for skip connection
+            layers.append(ResBlock(in_ch, out_channels, cond_dim))
+        self.layers = nn.ModuleList(layers)
+        
+        # Optional attention
+        self.attention = AttentionBlock(out_channels) if attention else None
+        
+    def forward(self, x, skip, cond):
+        if self.upsample:
+            x = self.upsample_conv(x)
+            
+        # Concatenate skip connection
+        x = torch.cat([x, skip], dim=1)
+        
+        for layer in self.layers:
+            x = layer(x, cond)
+            
+        if self.attention:
+            x = self.attention(x)
+            
+        return x
+
+
+class UNetFlowMatching(FlowMatchingBase):
+    """
+    U-Net architecture optimized for Flow Matching on CIFAR-10.
+    
+    Features:
+    - Full U-Net with skip connections for better quality
+    - Multi-scale attention for global context
+    - FiLM conditioning throughout the network
+    - Optimized for 15-step generation
     """
     
-    def __init__(self, channels: int = 3, hidden_dim: int = 160, num_classes: int = 10):
-        super().__init__(channels, hidden_dim)
+    def __init__(self, channels: int = 3, base_channels: int = 128, num_classes: int = 10):
+        super().__init__(channels, base_channels)
         self.num_classes = num_classes
         
-        # Enhanced conditioning embeddings
+        # Time embedding (sinusoidal + MLP)
+        time_dim = base_channels * 4
         self.time_embedding = nn.Sequential(
-            nn.Linear(1, hidden_dim),
+            nn.Linear(base_channels, time_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * 4)
+            nn.Linear(time_dim, time_dim),
         )
         
+        # Class embedding
         self.class_embedding = nn.Sequential(
-            nn.Embedding(num_classes, hidden_dim),
+            nn.Embedding(num_classes, base_channels),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.SiLU(), 
-            nn.Linear(hidden_dim * 2, hidden_dim * 4)
+            nn.Linear(base_channels, time_dim),
         )
         
-        # Encoder: 32x32 -> 8x8
-        self.conv_in = nn.Conv2d(channels, hidden_dim, 3, padding=1)
+        # Initial convolution
+        self.conv_in = nn.Conv2d(channels, base_channels, 3, padding=1)
         
-        # Down path
-        self.down1 = nn.ModuleList([
-            ResBlock(hidden_dim, hidden_dim * 4),
-            ResBlock(hidden_dim, hidden_dim * 4),
-        ])
-        self.down1_conv = nn.Conv2d(hidden_dim, hidden_dim * 2, 3, stride=2, padding=1)
+        # U-Net encoder (downsampling path)
+        self.down1 = DownBlock(base_channels, base_channels, time_dim, attention=False)      # 32x32
+        self.down2 = DownBlock(base_channels, base_channels*2, time_dim, attention=False)   # 16x16  
+        self.down3 = DownBlock(base_channels*2, base_channels*4, time_dim, attention=True)  # 8x8
+        self.down4 = DownBlock(base_channels*4, base_channels*8, time_dim, attention=True, downsample=False)  # 8x8 (no downsample)
         
-        self.down2 = nn.ModuleList([
-            ResBlock(hidden_dim * 2, hidden_dim * 4),
-            ResBlock(hidden_dim * 2, hidden_dim * 4),
-        ])
-        self.down2_conv = nn.Conv2d(hidden_dim * 2, hidden_dim * 4, 3, stride=2, padding=1)
+        # U-Net decoder (upsampling path)
+        self.up4 = UpBlock(base_channels*8, base_channels*4, time_dim, attention=True, upsample=False)  # 8x8
+        self.up3 = UpBlock(base_channels*4, base_channels*2, time_dim, attention=True)   # 16x16
+        self.up2 = UpBlock(base_channels*2, base_channels, time_dim, attention=False)    # 32x32
+        self.up1 = UpBlock(base_channels, base_channels, time_dim, attention=False, upsample=False)  # 32x32
         
-        # Bottleneck with attention
-        self.bottleneck = nn.ModuleList([
-            ResBlock(hidden_dim * 4, hidden_dim * 4),
-            ResBlock(hidden_dim * 4, hidden_dim * 4),
-            SelfAttention(hidden_dim * 4),
-            ResBlock(hidden_dim * 4, hidden_dim * 4),
-        ])
-        
-        # Up path (NO skip connections - key for clean FM)
-        self.up2_conv = nn.ConvTranspose2d(hidden_dim * 4, hidden_dim * 2, 4, stride=2, padding=1)
-        self.up2 = nn.ModuleList([
-            ResBlock(hidden_dim * 2, hidden_dim * 4),
-            ResBlock(hidden_dim * 2, hidden_dim * 4),
-        ])
-        
-        self.up1_conv = nn.ConvTranspose2d(hidden_dim * 2, hidden_dim, 4, stride=2, padding=1)
-        self.up1 = nn.ModuleList([
-            ResBlock(hidden_dim, hidden_dim * 4),
-            ResBlock(hidden_dim, hidden_dim * 4),
-        ])
-        
-        # Output layer
+        # Output projection
         self.conv_out = nn.Sequential(
-            nn.GroupNorm(min(32, hidden_dim//4), hidden_dim),
+            nn.GroupNorm(32, base_channels),
             nn.SiLU(),
-            nn.Conv2d(hidden_dim, channels, 3, padding=1)
+            nn.Conv2d(base_channels, channels, 3, padding=1),
         )
         
-        # Zero-initialize final layer for training stability
+        # Initialize output layer to zero for stable training
         nn.init.zeros_(self.conv_out[-1].weight)
         nn.init.zeros_(self.conv_out[-1].bias)
+        
+        # Sinusoidal time embedding
+        self.register_buffer('time_embed', self._build_sinusoidal_embedding(base_channels))
+        
+    def _build_sinusoidal_embedding(self, dim):
+        """Create sinusoidal position embeddings."""
+        half_dim = dim // 2
+        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim) * -emb)
+        return emb
+        
+    def _get_time_embedding(self, t):
+        """Get sinusoidal time embeddings."""
+        # t is (batch_size, 1), we want (batch_size, dim)
+        t = t.squeeze(-1)  # (batch_size,)
+        emb = t[:, None] * self.time_embed[None, :]  # (batch_size, dim//2)
+        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)  # (batch_size, dim)
+        return emb
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, class_labels: torch.Tensor) -> torch.Tensor:
-        """Forward pass: predict velocity field v(x,t,c)."""
-        # Embed conditioning information
-        t_emb = self.time_embedding(t)
+        """Forward pass through U-Net."""
+        # Get embeddings
+        t_sinusoidal = self._get_time_embedding(t)
+        t_emb = self.time_embedding(t_sinusoidal)
         c_emb = self.class_embedding(class_labels)
-        cond = t_emb + c_emb  # Combined conditioning
         
-        # Encoder
-        h = self.conv_in(x)
+        # Combine time and class conditioning
+        cond = t_emb + c_emb
         
-        for block in self.down1:
-            h = block(h, cond)
-        h = self.down1_conv(h)
+        # Initial convolution
+        x = self.conv_in(x)
         
-        for block in self.down2:
-            h = block(h, cond)
-        h = self.down2_conv(h)
+        # Encoder with skip connections
+        x1, skip1 = self.down1(x, cond)      # 32x32 -> 16x16
+        x2, skip2 = self.down2(x1, cond)     # 16x16 -> 8x8
+        x3, skip3 = self.down3(x2, cond)     # 8x8 -> 8x8 (no downsample in down4)
+        x4, skip4 = self.down4(x3, cond)     # 8x8 -> 8x8
         
-        # Bottleneck
-        for block in self.bottleneck:
-            if isinstance(block, SelfAttention):
-                h = block(h)
-            else:
-                h = block(h, cond)
+        # Decoder with skip connections
+        x = self.up4(x4, skip4, cond)        # 8x8
+        x = self.up3(x, skip3, cond)         # 8x8 -> 16x16
+        x = self.up2(x, skip2, cond)         # 16x16 -> 32x32
+        x = self.up1(x, skip1, cond)         # 32x32
         
-        # Decoder (no skip connections)
-        h = self.up2_conv(h)
-        for block in self.up2:
-            h = block(h, cond)
-            
-        h = self.up1_conv(h)
-        for block in self.up1:
-            h = block(h, cond)
-        
-        return self.conv_out(h)
+        # Output
+        return self.conv_out(x)
 
 
 # ============================================================================
@@ -238,35 +304,32 @@ def sample_heun_optimized(model, x, labels, steps=20):
     return x
 
 
-def optimized_train_step(model, data_batch, labels_batch, optimizer, device):
+def unet_train_step(model, data_batch, labels_batch, optimizer, device):
     """
-    Optimized training step with:
-    1. Straightened path (α(t) = t²)
-    2. Beta(0.5,0.5) time sampling for endpoint emphasis
+    Optimized training step for U-Net Flow Matching.
+    Uses standard linear interpolation with uniform time sampling.
     """
     model.train()
     batch_size = data_batch.size(0)
+    
+    # Sample noise and time
     noise = torch.randn_like(data_batch)
+    t = torch.rand(batch_size, 1, device=device)
     
-    # Beta(0.5,0.5) sampling for U-shaped distribution (endpoint emphasis)
-    beta_dist = torch.distributions.Beta(0.5, 0.5)
-    t = beta_dist.sample((batch_size, 1)).to(device)
-    
-    # Straightened path: α(t) = t² makes ODE easier to integrate
-    gamma = 2.0
+    # Linear interpolation (standard Flow Matching)
     t_expanded = t.view(-1, 1, 1, 1)
-    alpha = t_expanded ** gamma
-    dalpha_dt = gamma * (t_expanded ** (gamma - 1) + 1e-6)
+    x_t = (1 - t_expanded) * noise + t_expanded * data_batch
     
-    # Interpolation and target velocity
-    x_t = (1 - alpha) * noise + alpha * data_batch
-    target_velocity = dalpha_dt * (data_batch - noise)
+    # Target velocity (constant for linear path)
+    target_velocity = data_batch - noise
     
-    # Predict and compute loss
+    # Predict velocity
     predicted_velocity = model(x_t, t, labels_batch)
+    
+    # MSE loss
     loss = F.mse_loss(predicted_velocity, target_velocity)
     
-    # Optimization step
+    # Optimization
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
@@ -307,11 +370,22 @@ class EMAHelper:
 # ============================================================================
 
 @torch.no_grad()
-def generate_samples(model, device, class_labels, num_steps=15):
-    """Generate samples using optimized settings."""
+def generate_samples(model, device, class_labels, num_steps=15, solver="heun"):
+    """Generate samples with U-Net Flow Matching."""
     model.eval()
     x = torch.randn(len(class_labels), 3, 32, 32, device=device)
-    return sample_heun_optimized(model, x, class_labels, steps=num_steps)
+    
+    if solver == "heun":
+        return sample_heun_optimized(model, x, class_labels, steps=num_steps)
+    else:
+        # Simple Euler method
+        time_steps = torch.linspace(0, 1, num_steps + 1, device=device)
+        for i in range(num_steps):
+            t_curr = time_steps[i].expand(x.size(0), 1)
+            dt = time_steps[i + 1] - time_steps[i]
+            v = model(x, t_curr, class_labels)
+            x = x + v * dt
+        return x
 
 
 def create_data_loader(batch_size=64):
@@ -346,6 +420,35 @@ def visualize_samples(samples, labels, save_path="samples.png"):
     print(f"Saved samples to {save_path}")
 
 
+def generate_specific_classes(model: UNetFlowMatching, device: torch.device, class_indices: list):
+    """Generate specific CIFAR-10 classes with U-Net Flow Matching."""
+    labels = torch.tensor(class_indices, device=device)
+    samples = generate_samples(model, device, labels, num_steps=15, solver="heun")
+    
+    # Convert for visualization
+    samples = (samples.cpu() + 1) / 2
+    
+    # Visualize
+    fig, axes = plt.subplots(1, len(class_indices), figsize=(3*len(class_indices), 3))
+    if len(class_indices) == 1:
+        axes = [axes]
+    
+    fig.suptitle("Generated CIFAR-10 Classes", fontsize=16)
+    
+    for i, (sample, class_idx) in enumerate(zip(samples, class_indices)):
+        img = sample.permute(1, 2, 0).clamp(0, 1)
+        axes[i].imshow(img)
+        class_name = CIFAR10_CLASSES[class_idx]
+        axes[i].set_title(f"{class_name}", fontsize=12)
+        axes[i].axis("off")
+    
+    plt.tight_layout()
+    plt.savefig("specific_cifar_classes.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Generated classes: {[CIFAR10_CLASSES[i] for i in class_indices]}")
+    print("Saved to specific_cifar_classes.png")
+
+
 # ============================================================================
 # MAIN TRAINING AND EVALUATION
 # ============================================================================
@@ -360,38 +463,37 @@ def main():
         torch.cuda.empty_cache()
     
     # Data and model
-    train_loader = create_data_loader(batch_size=64)
-    model = ConditionalFlowMatchingNetCIFAR(channels=3, hidden_dim=160, num_classes=10).to(device)
+    train_loader = create_data_loader(batch_size=32)  # Smaller batch for U-Net
+    model = UNetFlowMatching(channels=3, base_channels=128, num_classes=10).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print("Key Optimizations:")
-    print("- Straightened path (α(t) = t²)")
-    print("- Beta(0.5,0.5) time sampling")
-    print("- EMA weights (decay=0.999)")
-    print("- Cosine time grid + Heun solver")
+    print("U-Net Flow Matching Features:")
+    print("- Full U-Net with skip connections")
+    print("- Multi-scale attention blocks")
+    print("- FiLM conditioning throughout")
+    print("- EMA weights for stable generation")
+    print("- Optimized for 15-step inference")
     
     # Training setup
-    num_epochs = 50
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs-1, eta_min=1e-6)
-    ema_helper = EMAHelper(model, decay=0.999)
+    num_epochs = 100  # U-Net can benefit from longer training
+    optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    ema_helper = EMAHelper(model, decay=0.9999)  # Slightly higher decay for U-Net
     
     # Training loop
     for epoch in range(num_epochs):
         epoch_losses = []
         
-        # Warmup learning rate for first epoch
-        if epoch == 0:
+        # Warmup learning rate for first few epochs
+        if epoch < 5:
+            warmup_lr = 2e-4 * (epoch + 1) / 5
             for param_group in optimizer.param_groups:
-                param_group['lr'] = 1e-5
-        elif epoch == 1:
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = 1e-4
+                param_group['lr'] = warmup_lr
         
         for batch_idx, (data, labels) in enumerate(train_loader):
             data, labels = data.to(device), labels.to(device)
             
-            loss = optimized_train_step(model, data, labels, optimizer, device)
+            loss = unet_train_step(model, data, labels, optimizer, device)
             epoch_losses.append(loss)
             ema_helper.update(model)
             
@@ -402,7 +504,7 @@ def main():
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}, LR: {current_lr:.2e}")
         
-        if epoch >= 1:
+        if epoch >= 5:  # Start scheduler after warmup
             scheduler.step()
     
     # Generation with EMA weights
@@ -413,7 +515,8 @@ def main():
     all_labels = torch.arange(10, device=device).repeat(2)
     
     configs = [
-        (15, "Optimized Target (15 steps)"),
+        (15, "U-Net Target (15 steps)"),
+        (25, "U-Net High Quality (25 steps)"),
         (100, "Baseline (100 steps)")
     ]
     
@@ -435,13 +538,17 @@ def main():
         filename = f"results/cifar/{steps}steps.png"
         visualize_samples(samples, all_labels, save_path=filename)
     
+    # Generate specific classes
+    print("Generating specific classes...")
+    generate_specific_classes(model, device, [0, 3, 5, 8])  # airplane, cat, dog, ship
+    
     # Restore original weights
     ema_helper.restore(model)
     
-    print("\nOPTIMIZATION RESULTS:")
+    print("\nU-NET FLOW MATCHING RESULTS:")
     print("Target: 15 steps vs 100 steps = 6.7x speedup")
-    print("Key innovations: Straightened path + Beta sampling + EMA + Cosine grid")
-    print("Architecture: ResNet encoder-decoder (no skip connections)")
+    print("Architecture: Full U-Net with skip connections and multi-scale attention")
+    print("Key features: FiLM conditioning + EMA weights + Heun solver")
     print("Check generated images for quality comparison")
 
 
