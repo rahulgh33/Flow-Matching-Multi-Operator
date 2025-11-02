@@ -101,24 +101,28 @@ class InpaintingUNet(FlowMatchingBase):
     U-Net for Flow Matching Inpainting.
     
     Takes as input:
-    - Masked image (holes filled with zeros)
-    - Binary mask (1 = known pixel, 0 = hole)
+    - Current state x_t (3 channels)
+    - Observed pixels (3 channels) 
+    - Binary mask (1 channel)
     - Time t
     
     Outputs:
     - Velocity field for the entire image
     """
     
-    def __init__(self, channels: int = 3, base_channels: int = 128):
+    def __init__(self, channels: int = 3, base_channels: int = 64):  # Reduced from 128
         super().__init__(channels, base_channels)
         
-        # Input channels: image (3) + mask (1) = 4 total
-        input_channels = channels + 1
+        # Store for time embedding
+        self.base_channels = base_channels
         
-        # Time embedding
+        # Input channels: x_t (3) + observed (3) + mask (1) = 7 total
+        input_channels = channels * 2 + 1
+        
+        # Time embedding (sinusoidal produces 2*base_channels)
         time_dim = base_channels * 4
         self.time_embedding = nn.Sequential(
-            nn.Linear(base_channels, time_dim),
+            nn.Linear(base_channels * 2, time_dim),  # Fixed: 2*base_channels input
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
@@ -147,29 +151,24 @@ class InpaintingUNet(FlowMatchingBase):
         nn.init.zeros_(self.conv_out[-1].weight)
         nn.init.zeros_(self.conv_out[-1].bias)
         
-        # Sinusoidal time embedding
-        self.register_buffer('time_embed', self._build_sinusoidal_embedding(base_channels))
-        
-    def _build_sinusoidal_embedding(self, dim):
-        """Create sinusoidal position embeddings."""
-        half_dim = dim // 2
-        emb = torch.log(torch.tensor(10000.0)) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim) * -emb)
-        return emb
         
     def _get_time_embedding(self, t):
         """Get sinusoidal time embeddings."""
         t = t.squeeze(-1)
-        emb = t[:, None] * self.time_embed[None, :]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-        return emb
+        half_dim = self.base_channels  # Store base_channels as instance variable
+        freqs = torch.exp(
+            torch.arange(half_dim, device=t.device) * (-np.log(10000.0) / (half_dim - 1))
+        )
+        args = t[:, None] * freqs[None, :]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     
-    def forward(self, masked_image: torch.Tensor, mask: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, observed: torch.Tensor, mask: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for inpainting.
         
         Args:
-            masked_image: Image with holes filled with zeros (B, 3, H, W)
+            x_t: Current state being evolved (B, 3, H, W)
+            observed: Known pixels (mask * original_image) (B, 3, H, W)
             mask: Binary mask, 1=known pixel, 0=hole (B, 1, H, W)
             t: Time tensor (B, 1)
             
@@ -180,8 +179,8 @@ class InpaintingUNet(FlowMatchingBase):
         t_sinusoidal = self._get_time_embedding(t)
         t_emb = self.time_embedding(t_sinusoidal)
         
-        # Concatenate masked image and mask as input
-        x = torch.cat([masked_image, mask], dim=1)  # (B, 4, H, W)
+        # Concatenate current state, observed pixels, and mask
+        x = torch.cat([x_t, observed, mask], dim=1)  # (B, 7, H, W)
         
         # Initial convolution
         x = self.conv_in(x)
@@ -200,7 +199,7 @@ class InpaintingUNet(FlowMatchingBase):
         return self.conv_out(x)
 
 
-def create_random_mask(batch_size, height, width, hole_size_range=(8, 16), num_holes_range=(1, 3)):
+def create_random_mask(batch_size, height, width, hole_size_range=(8, 16), num_holes_range=(1, 3), device='cpu'):
     """
     Create random rectangular masks for inpainting.
     
@@ -209,12 +208,13 @@ def create_random_mask(batch_size, height, width, hole_size_range=(8, 16), num_h
         height, width: Image dimensions
         hole_size_range: (min_size, max_size) for hole dimensions
         num_holes_range: (min_holes, max_holes) per image
+        device: Device to create tensor on
         
     Returns:
         Binary mask tensor (batch_size, 1, height, width)
         1 = known pixel, 0 = hole to fill
     """
-    masks = torch.ones(batch_size, 1, height, width)
+    masks = torch.ones(batch_size, 1, height, width, device=device)
     
     for b in range(batch_size):
         num_holes = np.random.randint(num_holes_range[0], num_holes_range[1] + 1)
@@ -236,64 +236,67 @@ def create_random_mask(batch_size, height, width, hole_size_range=(8, 16), num_h
 
 def inpainting_train_step(model, data_batch, optimizer, device):
     """
-    Training step for inpainting Flow Matching.
+    Training step for inpainting Flow Matching with boundary-aware paths.
     
     Process:
     1. Create random masks for the batch
-    2. Apply masks to create masked images
-    3. Train Flow Matching to generate full images from masked inputs
+    2. Set up boundary-aware Flow Matching paths
+    3. Train model to predict velocity from current state
     """
     model.train()
     batch_size = data_batch.size(0)
     
-    # Create random masks
-    masks = create_random_mask(batch_size, 32, 32).to(device)
+    # Create random masks (directly on GPU)
+    masks = create_random_mask(batch_size, 32, 32, device=device)
     
-    # Apply masks to create masked images
-    masked_images = data_batch * masks  # Holes become zeros
+    # Observed pixels (known regions)
+    observed = masks * data_batch
     
     # Sample noise and time for Flow Matching
     noise = torch.randn_like(data_batch)
     t = torch.rand(batch_size, 1, device=device)
     
-    # Flow Matching interpolation
+    # Boundary-aware Flow Matching paths
+    # x0: keep known pixels, noise in holes
+    # x1: target image (ground truth)
+    x0 = observed + (1 - masks) * noise
+    x1 = data_batch
+    
+    # Linear interpolation
     t_expanded = t.view(-1, 1, 1, 1)
-    x_t = (1 - t_expanded) * noise + t_expanded * data_batch
+    x_t = (1 - t_expanded) * x0 + t_expanded * x1
     
-    # Target velocity (full image)
-    target_velocity = data_batch - noise
+    # Target velocity (zero on known pixels by construction)
+    target_velocity = x1 - x0
     
-    # Predict velocity using masked image + mask as conditioning
-    predicted_velocity = model(masked_images, masks, t)
+    # Predict velocity using current state x_t
+    predicted_velocity = model(x_t, observed, masks, t)
     
-    # Loss only on the masked regions (holes)
-    # This encourages the model to focus on filling holes correctly
-    hole_mask = (1 - masks)  # 1 where holes are, 0 where known pixels are
-    
-    # Compute loss weighted by hole regions
+    # Loss (weighted by holes with normalization)
+    hole_mask = (1 - masks)  # Focus on holes
     loss_full = F.mse_loss(predicted_velocity, target_velocity, reduction='none')
-    loss_holes = (loss_full * hole_mask).sum() / (hole_mask.sum() + 1e-8)
-    loss_known = (loss_full * masks).sum() / (masks.sum() + 1e-8)
+    loss = (loss_full * hole_mask).mean() / 4.0  # Normalize for [-1,1] range
     
-    # Combine losses (focus more on holes, but don't ignore known regions)
-    loss = 2.0 * loss_holes + 0.5 * loss_known
+    # Optional: small penalty on velocity in known regions
+    v_known = predicted_velocity * masks
+    loss += 0.001 * (v_known**2).mean()
     
     # Optimization
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
     
-    return loss.item(), loss_holes.item(), loss_known.item()
+    return loss.item()
 
 
 @torch.no_grad()
-def inpaint_image(model, masked_image, mask, device, num_steps=15):
+def inpaint_image(model, original_image, mask, device, num_steps=30):
     """
     Inpaint a single masked image using Flow Matching.
     
     Args:
         model: Trained inpainting model
-        masked_image: Image with holes (1, 3, H, W)
+        original_image: Original image with known pixels (1, 3, H, W)
         mask: Binary mask (1, 1, H, W)
         device: Device to run on
         num_steps: Number of integration steps
@@ -303,8 +306,11 @@ def inpaint_image(model, masked_image, mask, device, num_steps=15):
     """
     model.eval()
     
-    # Start from noise
-    x = torch.randn_like(masked_image)
+    # Observed pixels (known regions)
+    observed = mask * original_image
+    
+    # Start from boundary-aware x0: known pixels + noise in holes
+    x = observed + (1 - mask) * torch.randn_like(original_image)
     
     # Integration with Heun's method
     time_steps = torch.linspace(0, 1, num_steps + 1, device=device)
@@ -314,15 +320,14 @@ def inpaint_image(model, masked_image, mask, device, num_steps=15):
         t_next = time_steps[i + 1].expand(1, 1)
         dt = (t_next - t_curr).view(-1, 1, 1, 1)
         
-        # Heun's method
-        v1 = model(masked_image, mask, t_curr)
-        x_pred = x + v1 * dt
-        v2 = model(masked_image, mask, t_next)
+        # Heun's method - model sees current state x
+        v1 = model(x, observed, mask, t_curr)
+        x_euler = x + v1 * dt
+        v2 = model(x_euler, observed, mask, t_next)
         x = x + 0.5 * (v1 + v2) * dt
         
-        # Constrain known pixels to match the original image
-        # This is key for inpainting: preserve known regions
-        x = x * (1 - mask) + masked_image * mask
+        # Hard clamp known pixels (boundary condition)
+        x = observed + (1 - mask) * x
     
     return x
 
@@ -340,10 +345,14 @@ def create_cifar_inpainting_loader(batch_size=32):
 
 def visualize_inpainting_results(original, masked, mask, inpainted, save_path="inpainting_results.png"):
     """Visualize inpainting results: original, masked, and inpainted images."""
-    # Convert to [0, 1] for visualization
-    original = (original.cpu() + 1) / 2
-    masked = (masked.cpu() + 1) / 2
-    inpainted = (inpainted.cpu() + 1) / 2
+    # Debug: Print data ranges
+    print(f"Visualization - Original range: [{original.min():.3f}, {original.max():.3f}]")
+    print(f"Visualization - Inpainted range: [{inpainted.min():.3f}, {inpainted.max():.3f}]")
+    
+    # Convert to [0, 1] for visualization and clamp to valid range
+    original = ((original.cpu() + 1) / 2).clamp(0, 1)
+    masked = ((masked.cpu() + 1) / 2).clamp(0, 1)
+    inpainted = ((inpainted.cpu() + 1) / 2).clamp(0, 1)
     mask = mask.cpu()
     
     batch_size = min(8, original.size(0))
@@ -352,12 +361,12 @@ def visualize_inpainting_results(original, masked, mask, inpainted, save_path="i
     
     for i in range(batch_size):
         # Original image
-        axes[0, i].imshow(original[i].permute(1, 2, 0).clamp(0, 1))
+        axes[0, i].imshow(original[i].permute(1, 2, 0))
         axes[0, i].set_title("Original")
         axes[0, i].axis("off")
         
         # Masked image
-        axes[1, i].imshow(masked[i].permute(1, 2, 0).clamp(0, 1))
+        axes[1, i].imshow(masked[i].permute(1, 2, 0))
         axes[1, i].set_title("Masked")
         axes[1, i].axis("off")
         
@@ -367,7 +376,7 @@ def visualize_inpainting_results(original, masked, mask, inpainted, save_path="i
         axes[2, i].axis("off")
         
         # Inpainted result
-        axes[3, i].imshow(inpainted[i].permute(1, 2, 0).clamp(0, 1))
+        axes[3, i].imshow(inpainted[i].permute(1, 2, 0))
         axes[3, i].set_title("Inpainted")
         axes[3, i].axis("off")
     
@@ -382,32 +391,53 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Clear GPU memory
+    # Clear GPU memory and set conservative memory fraction
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(0.7)  # Conservative 70% of GPU memory
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print(f"GPU Memory Available: {torch.cuda.memory_reserved(0) / 1e9:.1f} GB")
     
     # Data and model
-    train_loader = create_cifar_inpainting_loader(batch_size=32)
-    model = InpaintingUNet(channels=3, base_channels=128).to(device)
+    train_loader = create_cifar_inpainting_loader(batch_size=24)  # Reduced for memory safety
+    model = InpaintingUNet(channels=3, base_channels=32).to(device)  # Ultra-safe size (~6M params)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print("Inpainting Flow Matching Features:")
     print("- U-Net with mask conditioning")
-    print("- Hole-focused loss weighting")
+    print("- Hole-focused loss weighting") 
     print("- Constrained generation (preserve known pixels)")
-    print("- 15-step fast inpainting")
+    print("- 30-step stable inpainting")
+    
+    # Dimension validation test
+    print("\nRunning dimension validation...")
+    try:
+        test_batch = torch.randn(2, 3, 32, 32, device=device)
+        test_mask = torch.ones(2, 1, 32, 32, device=device)
+        test_observed = test_batch * test_mask
+        test_t = torch.rand(2, 1, device=device)
+        
+        with torch.no_grad():
+            test_output = model(test_batch, test_observed, test_mask, test_t)
+            assert test_output.shape == (2, 3, 32, 32), f"Wrong output shape: {test_output.shape}"
+        
+        print("✅ Dimension validation passed!")
+        del test_batch, test_mask, test_observed, test_t, test_output
+        torch.cuda.empty_cache()
+        
+    except Exception as e:
+        print(f"❌ Dimension validation failed: {e}")
+        return
     
     # Training setup
     num_epochs = 50
     optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
-    ema_helper = EMAHelper(model, decay=0.9999)
+    ema_helper = EMAHelper(model, decay=0.999)  # Faster EMA for small dataset
     
     # Training loop
     for epoch in range(num_epochs):
         epoch_losses = []
-        epoch_hole_losses = []
-        epoch_known_losses = []
         
         # Warmup
         if epoch < 5:
@@ -416,27 +446,43 @@ def main():
                 param_group['lr'] = warmup_lr
         
         for batch_idx, (data, _) in enumerate(train_loader):  # Ignore labels for inpainting
-            data = data.to(device)
-            
-            loss, hole_loss, known_loss = inpainting_train_step(model, data, optimizer, device)
-            epoch_losses.append(loss)
-            epoch_hole_losses.append(hole_loss)
-            epoch_known_losses.append(known_loss)
-            
-            ema_helper.update(model)
-            
-            if batch_idx % 100 == 0:
-                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}")
-                print(f"  Total Loss: {loss:.4f}, Hole Loss: {hole_loss:.4f}, Known Loss: {known_loss:.4f}")
+            try:
+                data = data.to(device)
+                
+                loss = inpainting_train_step(model, data, optimizer, device)
+                epoch_losses.append(loss)
+                
+                ema_helper.update(model)
+                
+                if batch_idx % 100 == 0:
+                    print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx}, Loss: {loss:.4f}")
+                    
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"OOM at batch {batch_idx}, clearing cache and continuing...")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
         
         avg_loss = sum(epoch_losses) / len(epoch_losses)
-        avg_hole_loss = sum(epoch_hole_losses) / len(epoch_hole_losses)
-        avg_known_loss = sum(epoch_known_losses) / len(epoch_known_losses)
         current_lr = optimizer.param_groups[0]['lr']
         
-        print(f"Epoch {epoch+1} completed:")
-        print(f"  Avg Loss: {avg_loss:.4f}, Hole: {avg_hole_loss:.4f}, Known: {avg_known_loss:.4f}")
-        print(f"  LR: {current_lr:.2e}")
+        print(f"Epoch {epoch+1} completed: Avg Loss: {avg_loss:.4f}, LR: {current_lr:.2e}")
+        
+        # Validation preview every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            print("Generating validation preview...")
+            with torch.no_grad():
+                val_data = next(iter(train_loader))[0][:1].to(device)
+                val_mask = create_random_mask(1, 32, 32, hole_size_range=(10, 16), device=device)
+                val_masked = val_data * val_mask
+                val_inpainted = inpaint_image(model, val_data, val_mask, device, num_steps=20)
+                
+                visualize_inpainting_results(
+                    val_data, val_masked, val_mask, val_inpainted,
+                    save_path=f"results/cifar/sample_epoch_{epoch+1}.png"
+                )
         
         if epoch >= 5:
             scheduler.step()
@@ -449,19 +495,22 @@ def main():
     print("Testing inpainting...")
     test_data = next(iter(train_loader))[0][:8].to(device)  # Get 8 test images
     
-    # Create test masks
-    test_masks = create_random_mask(8, 32, 32, hole_size_range=(10, 20), num_holes_range=(1, 2)).to(device)
-    test_masked = test_data * test_masks
+    # Debug: Check data range
+    print(f"Test data range: [{test_data.min():.3f}, {test_data.max():.3f}]")
     
-    # Inpaint
+    # Create test masks
+    test_masks = create_random_mask(8, 32, 32, hole_size_range=(10, 20), num_holes_range=(1, 2), device=device)
+    test_masked = test_data * test_masks  # For visualization only
+    
+    # Inpaint using original images (not pre-masked)
     inpainted_results = []
     for i in range(8):
         inpainted = inpaint_image(
             model, 
-            test_masked[i:i+1], 
+            test_data[i:i+1],  # Pass original image
             test_masks[i:i+1], 
             device, 
-            num_steps=15
+            num_steps=30  # Stable 30 steps
         )
         inpainted_results.append(inpainted)
     
@@ -474,7 +523,7 @@ def main():
     # Visualize results
     visualize_inpainting_results(
         test_data, test_masked, test_masks, inpainted_batch,
-        save_path="results/cifar/inpainting_results.png"
+        save_path="results/cifar/inpainting_results_fixed.png"
     )
     
     # Restore original weights
@@ -482,8 +531,8 @@ def main():
     
     print("\nINPAINTING RESULTS:")
     print("Successfully trained Flow Matching for image inpainting")
-    print("Key features: Mask conditioning + hole-focused loss + constrained generation")
-    print("Check results/cifar/inpainting_results.png for visual results")
+    print("Key features: State-dependent velocity + boundary-aware paths + constrained generation")
+    print("Check results/cifar/inpainting_results_fixed.png for visual results")
 
 
 if __name__ == "__main__":

@@ -485,24 +485,39 @@ def main():
     model = UNetFlowMatching(channels=3, base_channels=128, num_classes=10).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print("U-Net Flow Matching Features:")
+    print("Extended U-Net Flow Matching Features:")
     print("- Full U-Net with skip connections")
     print("- Multi-scale attention blocks")
     print("- FiLM conditioning throughout")
     print("- EMA weights for stable generation")
-    print("- Optimized for 15-step inference")
+    print("- Two-phase training (100 + 50 epochs)")
+    print("- Fine-tuning for better quality")
     
-    # Training setup
-    num_epochs = 100  # U-Net can benefit from longer training
+    # Extended training setup for better results
+    num_epochs = 150  # Extended training
+    
+    # Two-phase training: normal then fine-tuning
+    phase1_epochs = 100
+    phase2_epochs = 50
+    
     optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
-    ema_helper = EMAHelper(model, decay=0.9999)  # Slightly higher decay for U-Net
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase1_epochs, eta_min=5e-5)
+    ema_helper = EMAHelper(model, decay=0.999)  # Faster EMA for better tracking
     
-    # Training loop
+    # Two-phase training loop
     for epoch in range(num_epochs):
         epoch_losses = []
         
-        # Warmup learning rate for first few epochs
+        # Phase transition at epoch 100
+        if epoch == phase1_epochs:
+            print(f"\n🔄 Switching to fine-tuning phase (epochs {phase1_epochs+1}-{num_epochs})")
+            # Lower learning rate for fine-tuning
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 5e-5
+            # Reset scheduler for phase 2
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase2_epochs, eta_min=1e-6)
+        
+        # Warmup learning rate for first few epochs only
         if epoch < 5:
             warmup_lr = 2e-4 * (epoch + 1) / 5
             for param_group in optimizer.param_groups:
