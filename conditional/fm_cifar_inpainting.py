@@ -426,6 +426,10 @@ def main():
             assert test_output.shape == (2, 3, 32, 32), f"Wrong output shape: {test_output.shape}"
         
         print("✅ Dimension validation passed!")
+        print(f"  Input shapes: x_t={test_batch.shape}, observed={test_observed.shape}, mask={test_mask.shape}")
+        print(f"  Time embedding: {test_t.shape} -> {model._get_time_embedding(test_t).shape}")
+        print(f"  Output shape: {test_output.shape}")
+        
         del test_batch, test_mask, test_observed, test_t, test_output
         torch.cuda.empty_cache()
         
