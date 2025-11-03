@@ -541,55 +541,28 @@ def main():
         if epoch >= 5:  # Start scheduler after warmup
             scheduler.step()
     
-    # Clear memory and prepare for generation
-    print("Clearing GPU memory before generation...")
-    torch.cuda.empty_cache()
-    
-    # Generation with EMA weights
-    print("Switching to EMA weights for generation...")
-    ema_helper.apply_shadow(model)
-    
-    # Generate comparison samples (reduced batch size for memory)
-    all_labels = torch.arange(10, device=device)  # Single example per class
-    
-    # Create results directory if it doesn't exist
+    # Save the trained model
+    print("Saving trained model...")
     import os
-    os.makedirs("results/cifar", exist_ok=True)
+    os.makedirs("models", exist_ok=True)
     
-    configs = [
-        (15, "Extended Fast (15 steps)"),
-        (25, "Extended Quality (25 steps)"),
-        (35, "Extended Best (35 steps)")  # Removed 100-step to save memory
-    ]
+    # Save both regular and EMA weights
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'ema_state_dict': ema_helper.shadow,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': num_epochs,
+        'loss': avg_loss,
+        'model_config': {
+            'channels': 3,
+            'base_channels': 128,
+            'num_classes': 10
+        }
+    }, 'models/fm_unet_extended_final.pth')
     
-    for steps, desc in configs:
-        print(f"Generating {desc}...")
-        if steps == 100:
-            # Use simple Euler for baseline comparison
-            x = torch.randn(len(all_labels), 3, 32, 32, device=device)
-            time_steps = torch.linspace(0, 1, steps + 1, device=device)
-            for i in range(steps):
-                t_curr = time_steps[i].expand(x.size(0), 1)
-                dt = time_steps[i + 1] - time_steps[i]
-                v = model(x, t_curr, all_labels)
-                x = x + v * dt
-            samples = x
-        else:
-            samples = generate_samples(model, device, all_labels, num_steps=steps)
-        
-        filename = f"results/cifar/{steps}steps.png"
-        visualize_samples(samples, all_labels, save_path=filename)
-        
-        # Clear memory between generations
-        del samples
-        torch.cuda.empty_cache()
-    
-    # Generate specific classes
-    print("Generating specific classes...")
-    generate_specific_classes(model, device, [0, 3, 5, 8])  # airplane, cat, dog, ship
-    
-    # Restore original weights
-    ema_helper.restore(model)
+    print("Model saved to models/fm_unet_extended_final.pth")
+    print("Training completed successfully!")
+    print("Use generate_samples.py to generate images from the trained model.")
     
     print("\nU-NET FLOW MATCHING RESULTS:")
     print("Target: 15 steps vs 100 steps = 6.7x speedup")
