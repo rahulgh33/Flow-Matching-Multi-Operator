@@ -476,12 +476,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Clear GPU memory
+    # Clear GPU memory and set conservative memory usage
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(0.8)  # Use 80% of GPU memory
     
     # Data and model
-    train_loader = create_data_loader(batch_size=32)  # Smaller batch for U-Net
+    train_loader = create_data_loader(batch_size=24)  # Reduced batch for extended training
     model = UNetFlowMatching(channels=3, base_channels=128, num_classes=10).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -540,21 +541,25 @@ def main():
         if epoch >= 5:  # Start scheduler after warmup
             scheduler.step()
     
+    # Clear memory and prepare for generation
+    print("Clearing GPU memory before generation...")
+    torch.cuda.empty_cache()
+    
     # Generation with EMA weights
     print("Switching to EMA weights for generation...")
     ema_helper.apply_shadow(model)
     
-    # Generate comparison samples
-    all_labels = torch.arange(10, device=device).repeat(2)
+    # Generate comparison samples (reduced batch size for memory)
+    all_labels = torch.arange(10, device=device)  # Single example per class
     
     # Create results directory if it doesn't exist
     import os
     os.makedirs("results/cifar", exist_ok=True)
     
     configs = [
-        (15, "U-Net Target (15 steps)"),
-        (25, "U-Net High Quality (25 steps)"),
-        (100, "Baseline (100 steps)")
+        (15, "Extended Fast (15 steps)"),
+        (25, "Extended Quality (25 steps)"),
+        (35, "Extended Best (35 steps)")  # Removed 100-step to save memory
     ]
     
     for steps, desc in configs:
@@ -574,6 +579,10 @@ def main():
         
         filename = f"results/cifar/{steps}steps.png"
         visualize_samples(samples, all_labels, save_path=filename)
+        
+        # Clear memory between generations
+        del samples
+        torch.cuda.empty_cache()
     
     # Generate specific classes
     print("Generating specific classes...")
