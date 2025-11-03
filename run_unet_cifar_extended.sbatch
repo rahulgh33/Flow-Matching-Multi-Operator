@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=6        # Efficient for CIFAR-10 data loading
 #SBATCH --gres=gpu:1
 #SBATCH --mem=32G                # Sufficient for U-Net + CIFAR-10
-#SBATCH --time=8:00:00           # Extended time for 150 epochs + fine-tuning
+#SBATCH --time=12:00:00          # Extended time limit for 150 epochs
 #SBATCH --output=fm_unet_extended_%j.out
 #SBATCH --error=fm_unet_extended_%j.err
 

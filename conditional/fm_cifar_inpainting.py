@@ -359,6 +359,10 @@ def visualize_inpainting_results(original, masked, mask, inpainted, save_path="i
     
     fig, axes = plt.subplots(4, batch_size, figsize=(2*batch_size, 8))
     
+    # Handle single image case (axes becomes 1D)
+    if batch_size == 1:
+        axes = axes.reshape(4, 1)
+    
     for i in range(batch_size):
         # Original image
         axes[0, i].imshow(original[i].permute(1, 2, 0))
