@@ -19,7 +19,7 @@ def load_model(model_path, device):
     """Load trained model from checkpoint."""
     print(f"Loading model from {model_path}...")
     
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     config = checkpoint['model_config']
     
     # Create model with saved config
@@ -29,13 +29,9 @@ def load_model(model_path, device):
         num_classes=config['num_classes']
     ).to(device)
     
-    # Load EMA weights (better quality)
-    if 'ema_state_dict' in checkpoint:
-        print("Loading EMA weights for better quality...")
-        model.load_state_dict(checkpoint['ema_state_dict'])
-    else:
-        print("Loading regular weights...")
-        model.load_state_dict(checkpoint['model_state_dict'])
+    # Load model weights (already contains EMA weights if available)
+    print("Loading model weights (with EMA applied during training)...")
+    model.load_state_dict(checkpoint['model_state_dict'])
     
     model.eval()
     

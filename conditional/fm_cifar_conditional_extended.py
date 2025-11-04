@@ -546,10 +546,12 @@ def main():
     import os
     os.makedirs("models", exist_ok=True)
     
-    # Save both regular and EMA weights
+    # Apply EMA weights to model for saving
+    ema_helper.apply_shadow(model)
+    
+    # Save model with EMA weights applied
     torch.save({
-        'model_state_dict': model.state_dict(),
-        'ema_state_dict': ema_helper.shadow,
+        'model_state_dict': model.state_dict(),  # This now contains EMA weights
         'optimizer_state_dict': optimizer.state_dict(),
         'epoch': num_epochs,
         'loss': avg_loss,
@@ -559,6 +561,9 @@ def main():
             'num_classes': 10
         }
     }, 'models/fm_unet_extended_final.pth')
+    
+    # Restore original weights
+    ema_helper.restore(model)
     
     print("Model saved to models/fm_unet_extended_final.pth")
     print("Training completed successfully!")
