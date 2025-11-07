@@ -28,6 +28,18 @@ from conditional.fm_cifar_conditional import (
 )
 
 
+def validate_shapes(x_t, observed, mask, t, context=""):
+    """Validate tensor shapes for debugging."""
+    assert x_t.shape[0] == observed.shape[0] == mask.shape[0] == t.shape[0], \
+        f"{context}: Batch size mismatch: x_t={x_t.shape[0]}, observed={observed.shape[0]}, mask={mask.shape[0]}, t={t.shape[0]}"
+    assert x_t.shape[1:] == observed.shape[1:] == (3, 32, 32), \
+        f"{context}: Image shape mismatch: x_t={x_t.shape}, observed={observed.shape}"
+    assert mask.shape[1:] == (1, 32, 32), \
+        f"{context}: Mask shape mismatch: {mask.shape}"
+    assert t.shape[1] == 1, \
+        f"{context}: Time shape mismatch: {t.shape}"
+
+
 def compute_observation_likelihood_gradient(x_t, observed, mask, t, noise_scale=0.1):
     """
     Compute ∇_x log p(c | x_t) - the likelihood term.
@@ -92,11 +104,20 @@ def conditional_flow_matching_sample(
     model.eval()
     batch_size = observed.size(0)
     
+    # Ensure all tensors on same device
+    observed = observed.to(device)
+    mask = mask.to(device)
+    class_label = class_label.to(device)
+    
     # Start from noise
     x = torch.randn_like(observed)
     
     # Initialize with observations (optional warm start)
     x = x * (1 - mask) + observed * mask
+    
+    # Debug: print shapes
+    if batch_size <= 2:  # Only for small batches
+        print(f"  Shape check: x={x.shape}, observed={observed.shape}, mask={mask.shape}")
     
     # Time grid
     if solver == "heun":
@@ -105,9 +126,13 @@ def conditional_flow_matching_sample(
         ts = torch.linspace(0, 1, num_steps + 1, device=device)
     
     for i in range(num_steps):
-        t_curr = ts[i].expand(batch_size, 1)
-        t_next = ts[i + 1].expand(batch_size, 1)
+        t_curr = ts[i].expand(batch_size, 1).to(device)
+        t_next = ts[i + 1].expand(batch_size, 1).to(device)
         dt = (t_next - t_curr).view(-1, 1, 1, 1)
+        
+        # Validate shapes (only first iteration)
+        if i == 0:
+            validate_shapes(x, observed, mask, t_curr, context=f"Step {i}")
         
         # Prior velocity: v_θ(x_t, t, class)
         v_prior = model(x, t_curr, class_label)
@@ -161,28 +186,29 @@ def create_sparse_observations(images, observation_ratio=0.3, pattern="random"):
     """
     B, C, H, W = images.shape
     device = images.device
+    dtype = images.dtype
     
     if pattern == "random":
         # Random sparse pixels
-        mask = (torch.rand(B, 1, H, W, device=device) < observation_ratio).float()
+        mask = (torch.rand(B, 1, H, W, device=device, dtype=dtype) < observation_ratio).float()
         
     elif pattern == "grid":
         # Regular grid pattern
-        mask = torch.zeros(B, 1, H, W, device=device)
+        mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
         stride = int(np.sqrt(1 / observation_ratio))
         mask[:, :, ::stride, ::stride] = 1.0
         
     elif pattern == "half":
         # Half image (left or top)
-        mask = torch.zeros(B, 1, H, W, device=device)
-        if torch.rand(1) > 0.5:
+        mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
+        if torch.rand(1, device=device) > 0.5:
             mask[:, :, :, :W//2] = 1.0  # Left half
         else:
             mask[:, :, :H//2, :] = 1.0  # Top half
             
     elif pattern == "edges":
         # Edge pixels only
-        mask = torch.zeros(B, 1, H, W, device=device)
+        mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
         mask[:, :, 0, :] = 1.0  # Top
         mask[:, :, -1, :] = 1.0  # Bottom
         mask[:, :, :, 0] = 1.0  # Left
@@ -288,34 +314,44 @@ def main():
     for pattern in patterns:
         print(f"\nTesting pattern: {pattern}")
         
-        # Create sparse observations
-        observed, mask = create_sparse_observations(
-            test_images, 
-            observation_ratio=0.3 if pattern == "random" else 0.5,
-            pattern=pattern
-        )
-        
-        for guidance in guidance_strengths:
-            print(f"  Guidance strength: {guidance}")
-            
-            # Generate using Bayesian conditional sampling
-            with torch.no_grad():
-                generated = conditional_flow_matching_sample(
-                    model,
-                    observed,
-                    mask,
-                    test_labels,
-                    device,
-                    num_steps=30,
-                    guidance_strength=guidance,
-                    solver="heun"
-                )
-            
-            # Visualize
-            save_path = f"results/cifar/conditional_{pattern}_guidance{guidance}.png"
-            visualize_conditional_sampling(
-                test_images, observed, mask, generated, save_path
+        try:
+            # Create sparse observations
+            observed, mask = create_sparse_observations(
+                test_images, 
+                observation_ratio=0.3 if pattern == "random" else 0.5,
+                pattern=pattern
             )
+            
+            print(f"  Created observations: observed={observed.shape}, mask={mask.shape}")
+            print(f"  Observation ratio: {mask.mean().item():.2%}")
+            
+            for guidance in guidance_strengths:
+                print(f"  Guidance strength: {guidance}")
+                
+                # Generate using Bayesian conditional sampling
+                with torch.no_grad():
+                    generated = conditional_flow_matching_sample(
+                        model,
+                        observed,
+                        mask,
+                        test_labels,
+                        device,
+                        num_steps=30,
+                        guidance_strength=guidance,
+                        solver="heun"
+                    )
+                
+                # Visualize
+                save_path = f"results/cifar/conditional_{pattern}_guidance{guidance}.png"
+                visualize_conditional_sampling(
+                    test_images, observed, mask, generated, save_path
+                )
+                
+        except Exception as e:
+            print(f"  ❌ Error with pattern {pattern}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
     
     print("\n✅ Conditional sampling completed!")
     print("Key advantages of this approach:")
