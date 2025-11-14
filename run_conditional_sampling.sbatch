@@ -11,8 +11,9 @@
 #SBATCH --output=fm_conditional_%j.out
 #SBATCH --error=fm_conditional_%j.err
 
-module load cuda/12.1.1 cudnn/9.2.0.82-12 conda
-conda activate /depot/lin491/apps/torch_env
+module load cuda/12.1.1 cudnn/9.2.0.82-12
+module load anaconda
+source activate /depot/lin491/apps/torch_env
 
 # Print job info
 echo "Job started at: $(date)"
