@@ -222,6 +222,11 @@ def create_sparse_observations(images, observation_ratio=0.3, pattern="random"):
 
 def visualize_conditional_sampling(original, observed, mask, generated, save_path="conditional_sampling.png"):
     """Visualize conditional sampling results."""
+    # Debug: Check inputs before conversion
+    print(f"    Viz debug - mask mean: {mask.mean().item():.2%}, "
+          f"observed non-zero: {(observed != 0).float().mean().item():.2%}, "
+          f"gen vs orig diff: {(generated - original).abs().mean().item():.4f}")
+    
     # Convert to [0, 1]
     original = ((original.cpu() + 1) / 2).clamp(0, 1)
     observed_vis = ((observed.cpu() + 1) / 2).clamp(0, 1)
@@ -324,6 +329,8 @@ def main():
             
             print(f"  Created observations: observed={observed.shape}, mask={mask.shape}")
             print(f"  Observation ratio: {mask.mean().item():.2%}")
+            print(f"  Mask min/max: {mask.min().item():.2f}/{mask.max().item():.2f}")
+            print(f"  Observed pixels are non-zero: {(observed.abs().sum() > 0).item()}")
             
             for guidance in guidance_strengths:
                 print(f"  Guidance strength: {guidance}")
@@ -340,6 +347,10 @@ def main():
                         guidance_strength=guidance,
                         solver="heun"
                     )
+                
+                # Debug: Check if generated is different from original
+                diff = (generated - test_images).abs().mean().item()
+                print(f"  Difference between generated and original: {diff:.4f}")
                 
                 # Visualize
                 save_path = f"results/cifar/conditional_{pattern}_guidance{guidance}.png"
