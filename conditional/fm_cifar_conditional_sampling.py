@@ -195,7 +195,7 @@ def create_sparse_observations(images, observation_ratio=0.3, pattern="random"):
     elif pattern == "grid":
         # Regular grid pattern
         mask = torch.zeros(B, 1, H, W, device=device, dtype=dtype)
-        stride = int(np.sqrt(1 / observation_ratio))
+        stride = max(2, int(np.sqrt(1 / observation_ratio)))  # Ensure stride >= 2
         mask[:, :, ::stride, ::stride] = 1.0
         
     elif pattern == "half":
@@ -321,9 +321,17 @@ def main():
         
         try:
             # Create sparse observations
+            # Set observation ratio based on pattern
+            if pattern == "random":
+                obs_ratio = 0.3  # 30% sparse pixels
+            elif pattern == "grid":
+                obs_ratio = 0.25  # Grid with stride=2 gives 25%
+            else:
+                obs_ratio = 0.5  # Half image
+            
             observed, mask = create_sparse_observations(
                 test_images, 
-                observation_ratio=0.3 if pattern == "random" else 0.5,
+                observation_ratio=obs_ratio,
                 pattern=pattern
             )
             
