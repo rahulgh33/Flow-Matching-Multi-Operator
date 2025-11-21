@@ -109,11 +109,8 @@ def conditional_flow_matching_sample(
     mask = mask.to(device)
     class_label = class_label.to(device)
     
-    # Start from noise
+    # Start from pure noise (no warm start)
     x = torch.randn_like(observed)
-    
-    # Initialize with observations (optional warm start)
-    x = x * (1 - mask) + observed * mask
     
     # Debug: print shapes
     if batch_size <= 2:  # Only for small batches
