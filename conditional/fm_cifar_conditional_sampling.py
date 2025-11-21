@@ -159,8 +159,8 @@ def conditional_flow_matching_sample(
             # Euler method
             x = x + v_posterior * dt
         
-        # Hard constraint: project onto observations (optional but recommended)
-        x = x * (1 - mask) + observed * mask
+        # DO NOT hard-overwrite mask here - let guidance handle it
+        # Removed: x = x * (1 - mask) + observed * mask
         
         # Stability clamp
         x = torch.clamp(x, -3, 3)
@@ -313,6 +313,7 @@ def main():
     patterns = ["random", "half", "grid"]
     guidance_strengths = [0.5, 1.0, 2.0]
     
+    
     for pattern in patterns:
         print(f"\nTesting pattern: {pattern}")
         
@@ -348,7 +349,7 @@ def main():
                         mask,
                         test_labels,
                         device,
-                        num_steps=30,
+                        num_steps=50,  # Increased from 30 for better accuracy
                         guidance_strength=guidance,
                         solver="heun"
                     )
