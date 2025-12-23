@@ -12,7 +12,9 @@
 #SBATCH --error=fm_amir_pde_full_%j.err
 
 module load cuda/12.1.1 cudnn/9.2.0.82-12 conda
-conda activate /depot/lin491/apps/torch_env
+
+# Use your own PDE environment (create with setup_pde_env.sbatch first)
+source activate pde_env
 
 # Create necessary directories
 mkdir -p models
@@ -25,13 +27,19 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $SLURMD_NODENAME"
 echo "GPU: $CUDA_VISIBLE_DEVICES"
 
-# Step 1: Install missing dependencies
-echo "📦 Installing missing dependencies..."
-pip install --user fipy tqdm
-
-# Optional: Try to install CuPy for GPU acceleration
-echo "🚀 Attempting to install CuPy for GPU acceleration..."
-pip install --user cupy-cuda12x || echo "⚠️  CuPy installation failed, will use CPU fallback"
+# Dependencies should already be installed in pde_env
+echo "🔍 Checking environment setup..."
+python -c "
+try:
+    import fipy; print('✅ FiPy available')
+except: print('❌ FiPy not available - run setup_pde_env.sbatch first')
+try:
+    import tqdm; print('✅ tqdm available')  
+except: print('❌ tqdm not available - run setup_pde_env.sbatch first')
+try:
+    import cupy; print('✅ CuPy available (GPU acceleration)')
+except: print('⚠️  CuPy not available (CPU fallback)')
+"
 
 # Step 2: Generate high-quality PDE data using Amir's method
 echo "🏭 Generating PDE data using Amir's method..."
