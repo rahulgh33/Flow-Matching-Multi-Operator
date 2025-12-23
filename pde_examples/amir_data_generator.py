@@ -162,7 +162,7 @@ def generate_pde_data(num_datasets=100, train_split=0.9, use_gpu=True):
         
         if use_gpu_solver:
             U_diff = gpu_solve_diffusion(
-                init_val_diff.reshape(nx, ny), 
+                np.array(init_val_diff).reshape(nx, ny), 
                 float(diffusivity_diff), 
                 float(timeStep), 
                 steps, 
@@ -172,7 +172,7 @@ def generate_pde_data(num_datasets=100, train_split=0.9, use_gpu=True):
             phi_diff_value = U_diff.ravel()
         else:
             phi_diff_value = cpu_solve_diffusion(
-                init_val_diff.reshape(nx, ny),
+                np.array(init_val_diff).reshape(nx, ny),
                 diffusivity_diff,
                 timeStep,
                 steps,
@@ -188,7 +188,7 @@ def generate_pde_data(num_datasets=100, train_split=0.9, use_gpu=True):
         
         if use_gpu_solver:
             U_adve = gpu_solve_advection(
-                init_val_adve.reshape(nx, ny),
+                np.array(init_val_adve).reshape(nx, ny),
                 float(vel_adv),
                 float(timeStep),
                 steps,
@@ -209,7 +209,7 @@ def generate_pde_data(num_datasets=100, train_split=0.9, use_gpu=True):
         
         if use_gpu_solver:
             U_adv_diff = gpu_solve_advdiff(
-                init_val_adv_diff.reshape(nx, ny),
+                np.array(init_val_adv_diff).reshape(nx, ny),
                 float(vel_adv_diff),
                 float(diffusivity_adv_diff),
                 float(timeStep),
