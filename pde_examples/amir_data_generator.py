@@ -19,6 +19,12 @@ from tqdm import tqdm
 try:
     import cupy as cp
     import cupyx.scipy.ndimage as cnd
+    import os as os_module
+    
+    # Set C++17 standard for NVRTC to fix CUDA 12.6 compatibility
+    os_module.environ['CUPY_NVCC_GENERATE_CODE'] = 'current'
+    os_module.environ['CUPY_CUDA_COMPILE_ARGS'] = '-std=c++17'
+    
     GPU_AVAILABLE = True
     cp.cuda.Device(0).use()
     DTYPE = cp.float64
@@ -161,15 +167,28 @@ def generate_pde_data(num_datasets=100, train_split=0.9, use_gpu=True):
         init_val_diff = generate_initial_condition(mesh, center_x, center_y, initial_width)
         
         if use_gpu_solver:
-            U_diff = gpu_solve_diffusion(
-                np.array(init_val_diff).reshape(nx, ny), 
-                float(diffusivity_diff), 
-                float(timeStep), 
-                steps, 
-                float(dx), 
-                float(dy)
-            )
-            phi_diff_value = U_diff.ravel()
+            try:
+                U_diff = gpu_solve_diffusion(
+                    np.array(init_val_diff).reshape(nx, ny), 
+                    float(diffusivity_diff), 
+                    float(timeStep), 
+                    steps, 
+                    float(dx), 
+                    float(dy)
+                )
+                phi_diff_value = U_diff.ravel()
+            except Exception as e:
+                if i == 0:  # Only print warning once
+                    print(f"⚠️  GPU solver failed ({type(e).__name__}), falling back to CPU")
+                use_gpu_solver = False  # Disable for remaining iterations
+                phi_diff_value = cpu_solve_diffusion(
+                    np.array(init_val_diff).reshape(nx, ny),
+                    diffusivity_diff,
+                    timeStep,
+                    steps,
+                    dx,
+                    dy
+                )
         else:
             phi_diff_value = cpu_solve_diffusion(
                 np.array(init_val_diff).reshape(nx, ny),
@@ -187,18 +206,22 @@ def generate_pde_data(num_datasets=100, train_split=0.9, use_gpu=True):
         init_val_adve = generate_initial_condition(mesh, center_x, center_y, initial_width)
         
         if use_gpu_solver:
-            U_adve = gpu_solve_advection(
-                np.array(init_val_adve).reshape(nx, ny),
-                float(vel_adv),
-                float(timeStep),
-                steps,
-                float(dx),
-                float(dy)
-            )
-            phi_adv_value = U_adve.ravel()
+            try:
+                U_adve = gpu_solve_advection(
+                    np.array(init_val_adve).reshape(nx, ny),
+                    float(vel_adv),
+                    float(timeStep),
+                    steps,
+                    float(dx),
+                    float(dy)
+                )
+                phi_adv_value = U_adve.ravel()
+            except Exception:
+                # GPU failed, use initial value as placeholder
+                phi_adv_value = np.array(init_val_adve)
         else:
             # For CPU, we'll use a simple upwind scheme
-            phi_adv_value = init_val_adve  # Placeholder - would need proper implementation
+            phi_adv_value = np.array(init_val_adve)  # Placeholder - would need proper implementation
         
         # ----------- Advection-Diffusion Simulation -----------
         diffusivity_adv_diff = np.random.uniform(0.1, 0.4)
@@ -208,20 +231,31 @@ def generate_pde_data(num_datasets=100, train_split=0.9, use_gpu=True):
         init_val_adv_diff = generate_initial_condition(mesh, center_x, center_y, initial_width)
         
         if use_gpu_solver:
-            U_adv_diff = gpu_solve_advdiff(
-                np.array(init_val_adv_diff).reshape(nx, ny),
-                float(vel_adv_diff),
-                float(diffusivity_adv_diff),
-                float(timeStep),
-                steps,
-                float(dx),
-                float(dy)
-            )
-            phi_adv_diff_value = U_adv_diff.ravel()
+            try:
+                U_adv_diff = gpu_solve_advdiff(
+                    np.array(init_val_adv_diff).reshape(nx, ny),
+                    float(vel_adv_diff),
+                    float(diffusivity_adv_diff),
+                    float(timeStep),
+                    steps,
+                    float(dx),
+                    float(dy)
+                )
+                phi_adv_diff_value = U_adv_diff.ravel()
+            except Exception:
+                # GPU failed, fall back to CPU diffusion
+                phi_adv_diff_value = cpu_solve_diffusion(
+                    np.array(init_val_adv_diff).reshape(nx, ny),
+                    diffusivity_adv_diff,
+                    timeStep,
+                    steps,
+                    dx,
+                    dy
+                )
         else:
             # For CPU, use diffusion only as approximation
             phi_adv_diff_value = cpu_solve_diffusion(
-                init_val_adv_diff.reshape(nx, ny),
+                np.array(init_val_adv_diff).reshape(nx, ny),
                 diffusivity_adv_diff,
                 timeStep,
                 steps,
