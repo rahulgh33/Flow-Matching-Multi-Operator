@@ -80,8 +80,8 @@ class PDE2DFlowMatching(nn.Module):
     def __init__(self, channels=1, base_channels=64):
         super().__init__()
         
-        # Time embedding
-        time_dim = base_channels * 4
+        # Time embedding - must match bottleneck dimension (base_channels*8)
+        time_dim = base_channels * 8
         self.time_embedding = nn.Sequential(
             nn.Linear(base_channels * 2, time_dim),  # *2 because sin/cos concatenation doubles dimension
             nn.SiLU(),
@@ -91,15 +91,15 @@ class PDE2DFlowMatching(nn.Module):
         # 2D U-Net for spatial processing
         self.conv_in = nn.Conv2d(channels, base_channels, 3, padding=1)
         
-        # Encoder
-        self.down1 = self._make_layer(base_channels, base_channels*2, time_dim)
-        self.down2 = self._make_layer(base_channels*2, base_channels*4, time_dim)
+        # Encoder (with downsampling)
+        self.down1 = self._make_layer(base_channels, base_channels*2, time_dim, downsample=True)
+        self.down2 = self._make_layer(base_channels*2, base_channels*4, time_dim, downsample=True)
         self.down3 = self._make_layer(base_channels*4, base_channels*8, time_dim, downsample=False)
         
-        # Decoder
-        self.up3 = self._make_layer(base_channels*8, base_channels*4, time_dim, upsample=False)
-        self.up2 = self._make_layer(base_channels*4*2, base_channels*2, time_dim, upsample=True)
-        self.up1 = self._make_layer(base_channels*2*2, base_channels, time_dim, upsample=True)
+        # Decoder (with upsampling)
+        self.up3 = self._make_layer(base_channels*8, base_channels*4, time_dim, downsample=False, upsample=False)
+        self.up2 = self._make_layer(base_channels*4*2, base_channels*2, time_dim, downsample=False, upsample=True)
+        self.up1 = self._make_layer(base_channels*2*2, base_channels, time_dim, downsample=False, upsample=True)
         
         # Output
         self.conv_out = nn.Sequential(
@@ -155,18 +155,25 @@ class PDE2DFlowMatching(nn.Module):
             v: Velocity field (batch, 1, 64, 64)
         """
         # Time embedding
-        t_sinusoidal = self._get_time_embedding(t)
-        t_emb = self.time_embedding(t_sinusoidal)
+        t_sinusoidal = self._get_time_embedding(t)  # (batch, base_channels*2)
+        assert t_sinusoidal.size(1) == self.base_channels * 2, \
+            f"Time sinusoidal embedding size mismatch: expected {self.base_channels*2}, got {t_sinusoidal.size(1)}"
+        
+        t_emb = self.time_embedding(t_sinusoidal)  # (batch, base_channels*8)
+        assert t_emb.size(1) == self.base_channels * 8, \
+            f"Time embedding size mismatch: expected {self.base_channels*8}, got {t_emb.size(1)}"
         
         # Initial convolution
-        x = self.conv_in(u)
+        x = self.conv_in(u)  # (batch, base_channels, 64, 64)
         
         # Encoder with skip connections
-        x1 = self.down1(x)  # 64x64 -> 32x32
-        x2 = self.down2(x1)  # 32x32 -> 16x16
-        x3 = self.down3(x2)  # 16x16 (bottleneck)
+        x1 = self.down1(x)  # (batch, base_channels*2, 32, 32)
+        x2 = self.down2(x1)  # (batch, base_channels*4, 16, 16)
+        x3 = self.down3(x2)  # (batch, base_channels*8, 16, 16) bottleneck
         
         # Add time conditioning to bottleneck
+        assert x3.size(1) == t_emb.size(1), \
+            f"Channel mismatch at bottleneck: x3 has {x3.size(1)} channels, t_emb has {t_emb.size(1)} features"
         x3 = x3 + t_emb.view(-1, t_emb.size(1), 1, 1)
         
         # Decoder with skip connections
