@@ -83,7 +83,7 @@ class PDE2DFlowMatching(nn.Module):
         # Time embedding
         time_dim = base_channels * 4
         self.time_embedding = nn.Sequential(
-            nn.Linear(base_channels, time_dim),
+            nn.Linear(base_channels * 2, time_dim),  # *2 because sin/cos concatenation doubles dimension
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
