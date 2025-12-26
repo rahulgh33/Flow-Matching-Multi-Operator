@@ -27,10 +27,22 @@ wheels/
 # Data directories
 data/
 datasets/
+train_data64/
+test_data64_cal/
 
-# Generated images (excluding results)
+# Results and outputs
+results/
+fm_results/
+outputs/
+
+# SLURM output files
+*.out
+*.err
+
+# Generated images
 *.jpg
 *.jpeg
+*.png
 
 # Virtual environments
 .env
