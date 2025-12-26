@@ -85,7 +85,14 @@ def test_accuracy():
         return False
     
     model = PDE2DFlowMatching(channels=1, base_channels=64).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    
+    # Handle both checkpoint dict and direct state_dict formats
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
     print("✅ Loaded trained model")
     
     # Test parameters
@@ -181,7 +188,13 @@ def test_generalization():
     
     # Load model
     model = PDE2DFlowMatching(channels=1, base_channels=64).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    
+    # Handle both checkpoint dict and direct state_dict formats
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
     
     # Fixed initial condition, varying diffusivity
     nx, ny = 64, 64
@@ -249,7 +262,13 @@ def test_speed():
     
     # Load model
     model = PDE2DFlowMatching(channels=1, base_channels=64).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    
+    # Handle both checkpoint dict and direct state_dict formats
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
     
     # Test multiple samples
     nx, ny = 64, 64
